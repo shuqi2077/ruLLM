@@ -1,6 +1,6 @@
 //! Model loading, generation and scheduling on Ruda tensors and compute libraries.
 
-mod cube_inference;
+mod ruda_inference;
 mod generation;
 mod huggingface;
 mod llama;

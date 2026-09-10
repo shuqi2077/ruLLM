@@ -186,7 +186,7 @@ fn real_checkpoint_projection_diagnosis() {
         let expected = floats(&reference.join(format!("{name}.f32")));
         let actual = delta::Delta::gate_projection(linear,input.clone()).unwrap().cast(DType::F32).into_data().to_vec::<f32>().unwrap();
         assert_eq!(actual,expected,"precision-sensitive gate projection must match fixed reference");
-        for (strategy_name,strategy) in [("default",MatmulStrategy::default()),("cube",MatmulStrategy::Cube),("naive",MatmulStrategy::Naive)] {
+        for (strategy_name,strategy) in [("default",MatmulStrategy::default()),("ruda",MatmulStrategy::Ruda),("naive",MatmulStrategy::Naive)] {
             let result = matmul(input.clone().into_primitive().tensor(),linear.weight.val().unsqueeze::<3>().into_primitive().tensor(),None,strategy,DType::BF16).unwrap();
             let actual = Tensor::<B,3>::from_primitive(TensorPrimitive::Float(result)).cast(DType::F32).into_data().to_vec::<f32>().unwrap();
             let error = actual.iter().zip(&expected).map(|(&a,&b)| (a as f64-b as f64).powi(2)).sum::<f64>();
@@ -195,11 +195,11 @@ fn real_checkpoint_projection_diagnosis() {
             let max = actual.iter().zip(&expected).map(|(a,b)| (a-b).abs()).fold(0f32,f32::max);
             eprintln!("projection {name} {strategy_name}: differing={differing} relative_l2={} max_abs={max}",(error/norm).sqrt());
         }
-        for (label,naive) in [("cube",false),("naive",true)] {
+        for (label,naive) in [("ruda",false),("naive",true)] {
             B::sync(&device).unwrap();
             let start = std::time::Instant::now();
             for _ in 0..20 {
-                let strategy = if naive { MatmulStrategy::Naive } else { MatmulStrategy::Cube };
+                let strategy = if naive { MatmulStrategy::Naive } else { MatmulStrategy::Ruda };
                 let _ = matmul(input.clone().into_primitive().tensor(),linear.weight.val().unsqueeze::<3>().into_primitive().tensor(),None,strategy,DType::BF16).unwrap();
             }
             B::sync(&device).unwrap();

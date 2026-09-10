@@ -2,7 +2,7 @@ use half::bf16;
 use ruda_tensor::api::backend::Backend;
 use ruda_tensor_device::cuda::{Cuda, CudaDevice};
 use rullm::{
-    GreedyGenerationConfig, generate_greedy_packed_cube, load_huggingface_qwen2_pipeline,
+    GreedyGenerationConfig, generate_greedy_packed_ruda, load_huggingface_qwen2_pipeline,
 };
 use std::{error::Error, io, time::Instant};
 
@@ -38,7 +38,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     }));
     for run in 1..=runs {
         let started = Instant::now();
-        let output = generate_greedy_packed_cube(
+        let output = generate_greedy_packed_ruda(
             &model, &config, &prompt_ids,
             &GreedyGenerationConfig {
                 max_new_tokens,

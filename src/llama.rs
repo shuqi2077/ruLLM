@@ -13,7 +13,7 @@ use ruda::runtime::server::ComputeServer;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
-use crate::cube_inference;
+use crate::ruda_inference;
 
 pub(crate) mod awq;
 pub(crate) mod rope;
@@ -416,7 +416,7 @@ impl<B: Backend> LlamaAttention<B> {
         let context = if sequence == 1 {
             // `[B, Hq, 1, D]` already has the same physical element order as
             // `[B, 1, Hq * D]`; swapping the two singleton-adjacent axes first
-            // makes CubeCL materialize an otherwise unnecessary copy.
+            // makes Ruda materialize an otherwise unnecessary copy.
             context.reshape([batch, sequence, self.num_query_heads * self.head_dimension])
         } else {
             context.swap_dims(1, 2).reshape([
@@ -577,7 +577,7 @@ impl<B: Backend> LlamaDecoderLayer<B> {
 }
 
 
-/// Decoder-only causal language model assembled from Burn's native modules.
+/// Decoder-only causal language model assembled from Ruda's native modules.
 #[derive(Module, Debug)]
 pub struct LlamaForCausalLm<B: Backend> {
     pub embed_tokens: Embedding<B>,
@@ -639,7 +639,7 @@ impl<B: Backend> LlamaForCausalLm<B> {
     pub fn init_qwen2(config: &LlamaConfig, device: &B::Device) -> Result<Self, LlamaConfigError> {
         config.validate()?;
         // Every decoder layer uses the same immutable RoPE frequencies. A
-        // cloned Burn tensor is a shared device handle, so build the cache
+        // cloned Ruda tensor is a shared device handle, so build the cache
         // once instead of recomputing and storing one copy per layer.
         let rope = qwen2_rope::<B>(config, device);
         Self::init_with_layers(
@@ -757,7 +757,7 @@ impl<B: Backend> LlamaForCausalLm<B> {
     }
 
     /// Consume a loaded model and pack Q/K/V and gate/up into trainable
-    /// parameters. The returned module remains fully visible to Burn's
+    /// parameters. The returned module remains fully visible to Ruda's
     /// autodiff and optimizer traversal while reducing projection launches.
     pub fn into_packed_training(self) -> PackedLlamaForCausalLm<B> {
         let layers = self
@@ -789,7 +789,7 @@ impl<B: Backend> PackedLlamaAttention<B> {
             head_dimension,
         } = attention;
         // Preserve the col-major view used by Qwen's LinearLayout::Col.
-        // CubeCL has optimized decode-time vec-mat kernels for this layout,
+        // Ruda has optimized decode-time vec-mat kernels for this layout,
         // while a directly concatenated row-major RHS takes its slower path.
         let qkv_weight = Param::from_tensor(
             Tensor::cat(
@@ -1034,13 +1034,13 @@ where
     I: IntElement,
     BT: BoolElement,
 {
-    fn forward_cube(
+    fn forward_ruda(
         &self,
         input: Tensor<DeviceBackend<R, F, I, BT>, 3>,
     ) -> Tensor<DeviceBackend<R, F, I, BT>, 3> {
         let gate_up = linear(input, self.gate_up_weight.val(), None);
         self.down_proj
-            .forward(cube_inference::swiglu(gate_up, self.d_ff))
+            .forward(ruda_inference::swiglu(gate_up, self.d_ff))
     }
 }
 
@@ -1053,7 +1053,7 @@ where
     I: IntElement,
     BT: BoolElement,
 {
-    fn forward_cached_cube(
+    fn forward_cached_ruda(
         &self,
         input: Tensor<DeviceBackend<R, F, I, BT>, 3>,
         cache: &mut LlamaLayerCache<DeviceBackend<R, F, I, BT>>,
@@ -1084,7 +1084,7 @@ where
                     &device,
                     dtype,
                 );
-                let (query, key, value) = cube_inference::qkv_half_split_rope_cached(
+                let (query, key, value) = ruda_inference::qkv_half_split_rope_cached(
                     projected,
                     self.rope.freq_complex.clone(),
                     key_storage,
@@ -1124,7 +1124,7 @@ where
             }
         };
         let context = if sequence == 1 && self.head_dimension == 64 {
-            cube_inference::gqa_decode_attention(query, key, value, key_sequence)
+            ruda_inference::gqa_decode_attention(query, key, value, key_sequence)
         } else {
             let key = key.slice([
                 0..batch,
@@ -1206,28 +1206,28 @@ where
     I: IntElement,
     BT: BoolElement,
 {
-    fn forward_cached_cube(
+    fn forward_cached_ruda(
         &self,
         input: Tensor<DeviceBackend<R, F, I, BT>, 3>,
         cache: &mut LlamaLayerCache<DeviceBackend<R, F, I, BT>>,
         position: usize,
     ) -> Tensor<DeviceBackend<R, F, I, BT>, 3> {
         let residual = input.clone();
-        let normalized = cube_inference::rms_norm(
+        let normalized = ruda_inference::rms_norm(
             input,
             self.input_layernorm.gamma.val(),
             self.input_layernorm.epsilon,
         );
         let attention = self
             .self_attn
-            .forward_cached_cube(normalized, cache, position);
-        let (hidden, normalized) = cube_inference::residual_rms_norm(
+            .forward_cached_ruda(normalized, cache, position);
+        let (hidden, normalized) = ruda_inference::residual_rms_norm(
             residual,
             attention,
             self.post_attention_layernorm.gamma.val(),
             self.post_attention_layernorm.epsilon,
         );
-        hidden + self.mlp.forward_cube(normalized)
+        hidden + self.mlp.forward_ruda(normalized)
     }
 }
 
@@ -1291,8 +1291,8 @@ where
     I: IntElement,
     BT: BoolElement,
 {
-    /// Cached inference using the dedicated CubeCL RMSNorm and SwiGLU kernels.
-    pub fn forward_cached_last_cube(
+    /// Cached inference using the dedicated Ruda RMSNorm and SwiGLU kernels.
+    pub fn forward_cached_last_ruda(
         &self,
         tokens: Tensor<DeviceBackend<R, F, I, BT>, 2, Int>,
         cache: &mut LlamaKvCache<DeviceBackend<R, F, I, BT>>,
@@ -1313,12 +1313,12 @@ where
         );
         let mut hidden = self.embed_tokens.forward(tokens);
         for (layer, layer_cache) in self.layers.iter().zip(cache.layers.iter_mut()) {
-            hidden = layer.forward_cached_cube(hidden, layer_cache, cache.position);
+            hidden = layer.forward_cached_ruda(hidden, layer_cache, cache.position);
         }
         cache.position = end;
         let [batch, sequence, width] = hidden.dims();
         let hidden = hidden.slice([0..batch, sequence - 1..sequence, 0..width]);
-        let hidden = cube_inference::rms_norm(hidden, self.norm.gamma.val(), self.norm.epsilon);
+        let hidden = ruda_inference::rms_norm(hidden, self.norm.gamma.val(), self.norm.epsilon);
         self.lm_head.forward(hidden)
     }
 }
@@ -1326,7 +1326,7 @@ where
 
 
 /// Qwen2 repeats each RoPE frequency across the first and second halves of a
-/// head, then rotates those halves against one another. Burn's stock
+/// head, then rotates those halves against one another. Ruda's stock
 /// `RotaryEncoding` instead rotates adjacent pairs, so recover the cached
 /// cosine/sine values and apply Qwen's exact layout explicitly.
 fn apply_half_split_rope<B: Backend>(

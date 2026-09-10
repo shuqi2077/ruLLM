@@ -68,7 +68,7 @@ where
         let context = if sequence == 1 {
             // `[B, Hq, 1, D]` already has the same physical element order as
             // `[B, 1, Hq * D]`; swapping the two singleton-adjacent axes first
-            // makes CubeCL materialize an otherwise unnecessary copy.
+            // makes Ruda materialize an otherwise unnecessary copy.
             context.reshape([batch, sequence, self.num_query_heads * self.head_dimension])
         } else {
             context.swap_dims(1, 2).reshape([

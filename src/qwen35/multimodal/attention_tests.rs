@@ -48,7 +48,7 @@ fn real_full_attention_components() {
     let transposed = values.clone().swap_dims(2,3).matmul(read("probabilities",DType::BF16).swap_dims(2,3)).swap_dims(2,3).swap_dims(1,2);
     compare("transposed operand matmul","core",transposed);
     let f32_output = rublas::tensor_matmul::matmul(read("probabilities",DType::BF16).into_primitive().tensor(),
-        values.clone().into_primitive().tensor(),None,rublas::tensor_matmul::MatmulStrategy::Cube,DType::F32).unwrap();
+        values.clone().into_primitive().tensor(),None,rublas::tensor_matmul::MatmulStrategy::Ruda,DType::F32).unwrap();
     let f32_output = Tensor::<B,4>::from_primitive(TensorPrimitive::Float(f32_output)).swap_dims(1,2);
     compare("separate output cast","core",f32_output.clone().cast(DType::BF16));
     if let Ok(path) = std::env::var("RUDA_QWEN35_ATTENTION_ACCUM_OUTPUT") {

@@ -4,7 +4,7 @@ use crate::{
 };
 use ruda_model::module::Param;
 use ruda_tensor::api::backend::Backend;
-use ruda_store::{ModuleSnapshot, PyTorchToBurnAdapter, SafetensorsStore};
+use ruda_store::{ModuleSnapshot, PyTorchToRudaAdapter, SafetensorsStore};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -206,7 +206,7 @@ pub fn load_huggingface_llama<B: Backend>(
                 "$1.gamma",
             )
             .with_key_remapping(r"^norm\.weight$", "norm.gamma")
-            .with_from_adapter(PyTorchToBurnAdapter)
+            .with_from_adapter(PyTorchToRudaAdapter)
             .allow_partial(true)
             .validate(true);
         let result = model.load_from(&mut store).map_err(|error| {

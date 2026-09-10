@@ -23,7 +23,7 @@ fn real_qwen05_checkpoint_generation() {
         eos_token_ids: pipeline.loaded.default_eos_token_ids,
     };
     for run in 1..=2 {
-        let output = crate::generate_greedy_packed_cube(
+        let output = crate::generate_greedy_packed_ruda(
             &model, &config, &prompt, &generation, &device,
         ).unwrap();
         eprintln!("Qwen2.5-0.5B run={run} tokens={:?}", output.generated_token_ids);

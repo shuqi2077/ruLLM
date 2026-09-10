@@ -13,7 +13,7 @@ mod sampling;
 pub use awq::{generate_greedy_awq, generate_sampled_awq};
 pub use sampling::{
     SamplingConfig, SamplingGenerationConfig, TokenSampler, generate_causal_sampled, generate_sampled,
-    generate_sampled_packed, generate_sampled_packed_cube,
+    generate_sampled_packed, generate_sampled_packed_ruda,
 };
 
 /// Deterministic autoregressive decoding options. Sampling is deliberately not
@@ -93,8 +93,8 @@ pub fn generate_greedy_packed<B: Backend>(
     generate_greedy_impl(model, model_config, prompt_token_ids, generation, device)
 }
 
-/// Run packed inference with the dedicated CubeCL RMSNorm and SwiGLU kernels.
-pub fn generate_greedy_packed_cube<R, F, I, BT>(
+/// Run packed inference with the dedicated Ruda RMSNorm and SwiGLU kernels.
+pub fn generate_greedy_packed_ruda<R, F, I, BT>(
     model: &PackedLlamaForCausalLm<DeviceBackend<R, F, I, BT>>,
     model_config: &LlamaConfig,
     prompt_token_ids: &[i32],
@@ -110,7 +110,7 @@ where
     BT: BoolElement,
 {
     generate_greedy_impl(
-        &CubePackedModel(model),
+        &RudaPackedModel(model),
         model_config,
         prompt_token_ids,
         generation,
@@ -118,14 +118,14 @@ where
     )
 }
 
-struct CubePackedModel<'a, R, F, I, BT>(&'a PackedLlamaForCausalLm<DeviceBackend<R, F, I, BT>>)
+struct RudaPackedModel<'a, R, F, I, BT>(&'a PackedLlamaForCausalLm<DeviceBackend<R, F, I, BT>>)
 where
     R: DeviceRuntime,
     F: FloatElement,
     I: IntElement,
     BT: BoolElement;
 
-impl<R, F, I, BT> CausalModel<DeviceBackend<R, F, I, BT>> for CubePackedModel<'_, R, F, I, BT>
+impl<R, F, I, BT> CausalModel<DeviceBackend<R, F, I, BT>> for RudaPackedModel<'_, R, F, I, BT>
 where
     R: DeviceRuntime,
     R::Server: ComputeServer,
@@ -145,7 +145,7 @@ where
         tokens: Tensor<DeviceBackend<R, F, I, BT>, 2, Int>,
         cache: &mut LlamaKvCache<DeviceBackend<R, F, I, BT>>,
     ) -> Tensor<DeviceBackend<R, F, I, BT>, 3> {
-        self.0.forward_cached_last_cube(tokens, cache)
+        self.0.forward_cached_last_ruda(tokens, cache)
     }
 
     fn greedy_token(

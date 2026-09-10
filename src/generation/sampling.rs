@@ -1,5 +1,5 @@
 use super::{
-    CausalModel, CausalModelLimits, CubePackedModel, GenerationError, GreedyGenerationConfig,
+    CausalModel, CausalModelLimits, RudaPackedModel, GenerationError, GreedyGenerationConfig,
     TokenGenerationOutput, generate_with_selector,
 };
 use crate::{LlamaConfig, LlamaForCausalLm, PackedLlamaForCausalLm};
@@ -198,7 +198,7 @@ pub fn generate_sampled_packed<B: Backend>(
     generate_sampled_impl(model, model_config, prompt_token_ids, generation, device)
 }
 
-pub fn generate_sampled_packed_cube<R, F, I, BT>(
+pub fn generate_sampled_packed_ruda<R, F, I, BT>(
     model: &PackedLlamaForCausalLm<DeviceBackend<R, F, I, BT>>,
     model_config: &LlamaConfig,
     prompt_token_ids: &[i32],
@@ -214,7 +214,7 @@ where
     BT: BoolElement,
 {
     generate_sampled_impl(
-        &CubePackedModel(model),
+        &RudaPackedModel(model),
         model_config,
         prompt_token_ids,
         generation,

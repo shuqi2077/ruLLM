@@ -10,7 +10,7 @@ mod arithmetic_contract {
     use ruda_kernel::dsl::prelude::*;
     use ruda_tensor::api::Tensor;
 
-    #[cube(launch)]
+    #[ruda(launch)]
     fn separate_and_fused(input: &Array<f32>, output: &mut Array<f32>) {
         let a = input[0];
         let b = input[1];
@@ -28,7 +28,7 @@ mod arithmetic_contract {
         let input = Tensor::<B,1>::from_data(TensorData::new(vec![a,b,-1.0],[3]),(&device,DType::F32)).into_primitive().tensor();
         let output = Tensor::<B,1>::zeros([2],(&device,DType::F32)).into_primitive().tensor();
         separate_and_fused::launch::<ruda_driver_cuda::CudaRuntime>(&input.client,
-            CubeCount::Static(1,1,1),CubeDim::new_1d(1),input.clone().into_array_arg(),output.clone().into_array_arg());
+            RudaCount::Static(1,1,1),RudaDim::new_1d(1),input.clone().into_array_arg(),output.clone().into_array_arg());
         let actual = Tensor::<B,1>::from_primitive(TensorPrimitive::Float(output)).into_data().to_vec::<f32>().unwrap();
         assert_eq!(actual,vec![(a*b)-1.0,a.mul_add(b,-1.0)],"strict multiply/add and explicit FMA must retain distinct rounding");
     }

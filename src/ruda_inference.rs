@@ -1,17 +1,17 @@
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
-use ruda_kernel::dsl as cubecl;
+use ruda_kernel::dsl as kernel_dsl;
 use ruda_tensor::api::Tensor;
 use ruda_tensor::{DeviceOps, Shape, TensorPrimitive};
 use ruda_kernel::tensor::contiguous::into_contiguous;
 use ruda_kernel::tensor::allocation::empty_device_contiguous_dtype;
 use ruda_tensor_device::{BoolElement, DeviceBackend, DeviceRuntime, FloatElement, IntElement};
-use ruda_kernel::dsl::calculate_cube_count_elemwise;
+use ruda_kernel::dsl::calculate_ruda_count_elemwise;
 use ruda_kernel::dsl::prelude::*;
 use ruda::runtime::server::ComputeServer;
 
 
-#[cube(launch)]
+#[ruda(launch)]
 fn rms_norm_kernel<F: Float>(
     input: &Array<F>,
     gamma: &Array<F>,
@@ -20,7 +20,7 @@ fn rms_norm_kernel<F: Float>(
     epsilon: f32,
     #[define(F)] _dtype: StorageType,
 ) {
-    let row = CUBE_POS_X as usize;
+    let row = RUDA_POS_X as usize;
     let width = width as usize;
     let row_offset = row * width;
     let mut sum = 0.0f32;
@@ -29,7 +29,7 @@ fn rms_norm_kernel<F: Float>(
     while column < width {
         let value = f32::cast_from(input[row_offset + column]);
         sum += value * value;
-        column += CUBE_DIM_X as usize;
+        column += RUDA_DIM_X as usize;
     }
 
     sum = plane_sum(sum);
@@ -39,14 +39,14 @@ fn rms_norm_kernel<F: Float>(
     while column < width {
         let normalized = F::cast_from(f32::cast_from(input[row_offset + column]) * inverse_rms);
         output[row_offset + column] = normalized * gamma[column];
-        column += CUBE_DIM_X as usize;
+        column += RUDA_DIM_X as usize;
     }
 }
 
-#[cube(launch)]
+#[ruda(launch)]
 fn residual_rms_norm_kernel<F: Float>(
-    residual: &cubecl::prelude::Tensor<F>,
-    update: &cubecl::prelude::Tensor<F>,
+    residual: &kernel_dsl::prelude::Tensor<F>,
+    update: &kernel_dsl::prelude::Tensor<F>,
     gamma: &Array<F>,
     hidden: &mut Array<F>,
     normalized: &mut Array<F>,
@@ -54,7 +54,7 @@ fn residual_rms_norm_kernel<F: Float>(
     epsilon: f32,
     #[define(F)] _dtype: StorageType,
 ) {
-    let row = CUBE_POS_X as usize;
+    let row = RUDA_POS_X as usize;
     let width = width as usize;
     let row_offset = row * width;
     let sequence = residual.shape(1);
@@ -73,7 +73,7 @@ fn residual_rms_norm_kernel<F: Float>(
         hidden[position] = value;
         let value = f32::cast_from(value);
         sum += value * value;
-        column += CUBE_DIM_X as usize;
+        column += RUDA_DIM_X as usize;
     }
 
     sum = plane_sum(sum);
@@ -85,11 +85,11 @@ fn residual_rms_norm_kernel<F: Float>(
         let value = hidden[position];
         let unit = F::cast_from(f32::cast_from(value) * inverse_rms);
         normalized[position] = unit * gamma[column];
-        column += CUBE_DIM_X as usize;
+        column += RUDA_DIM_X as usize;
     }
 }
 
-#[cube(launch)]
+#[ruda(launch)]
 fn swiglu_kernel<F: Float>(
     gate_up: &Array<F>,
     output: &mut Array<F>,
@@ -111,10 +111,10 @@ fn swiglu_kernel<F: Float>(
     output[output_position] = silu * up;
 }
 
-#[cube(launch)]
+#[ruda(launch)]
 fn qkv_half_split_rope_kernel<F: Float>(
-    projected: &cubecl::prelude::Tensor<F>,
-    frequencies: &cubecl::prelude::Tensor<F>,
+    projected: &kernel_dsl::prelude::Tensor<F>,
+    frequencies: &kernel_dsl::prelude::Tensor<F>,
     query: &mut Array<F>,
     key: &mut Array<F>,
     value: &mut Array<F>,
@@ -212,7 +212,7 @@ fn qkv_half_split_rope_kernel<F: Float>(
     }
 }
 
-#[cube(launch)]
+#[ruda(launch)]
 fn gqa_decode_attention_kernel<F: Float>(
     query: &Array<F>,
     key: &Array<F>,
@@ -231,7 +231,7 @@ fn gqa_decode_attention_kernel<F: Float>(
     let key_sequence = key_sequence as usize;
     let key_capacity = key_capacity as usize;
     let head_dimension = head_dimension as usize;
-    let row = CUBE_POS_X as usize;
+    let row = RUDA_POS_X as usize;
     let batch = row / query_heads;
     let query_head = row % query_heads;
     let kv_head = query_head / (query_heads / kv_heads);
@@ -240,12 +240,12 @@ fn gqa_decode_attention_kernel<F: Float>(
 
     let lane = UNIT_POS_X as usize;
     let query_0 = f32::cast_from(query[query_offset + lane]);
-    let query_1 = f32::cast_from(query[query_offset + lane + CUBE_DIM_X as usize]);
+    let query_1 = f32::cast_from(query[query_offset + lane + RUDA_DIM_X as usize]);
     let mut softmax_maximum = SharedMemory::<f32>::new(1usize);
     if UNIT_POS_X == 0 {
         softmax_maximum[0] = -3.4028235e38f32;
     }
-    sync_cube();
+    sync_ruda();
 
     // Match the generic path's numerical boundary: matmul produces F, scale
     // is applied in F, then softmax reads the score as f32.
@@ -253,13 +253,13 @@ fn gqa_decode_attention_kernel<F: Float>(
         let key_offset = kv_offset + sequence_index * head_dimension;
         let mut dot = 0.0f32;
         dot += query_0 * f32::cast_from(key[key_offset + lane]);
-        dot += query_1 * f32::cast_from(key[key_offset + lane + CUBE_DIM_X as usize]);
+        dot += query_1 * f32::cast_from(key[key_offset + lane + RUDA_DIM_X as usize]);
         let rounded_dot = f32::cast_from(F::cast_from(plane_sum(dot)));
         let score = f32::cast_from(F::cast_from(rounded_dot * scale));
         if UNIT_POS_X == 0 && score > softmax_maximum[0] {
             softmax_maximum[0] = score;
         }
-        sync_cube();
+        sync_ruda();
     }
 
     let maximum = softmax_maximum[0];
@@ -268,7 +268,7 @@ fn gqa_decode_attention_kernel<F: Float>(
         let key_offset = kv_offset + sequence_index * head_dimension;
         let mut dot = 0.0f32;
         dot += query_0 * f32::cast_from(key[key_offset + lane]);
-        dot += query_1 * f32::cast_from(key[key_offset + lane + CUBE_DIM_X as usize]);
+        dot += query_1 * f32::cast_from(key[key_offset + lane + RUDA_DIM_X as usize]);
         let rounded_dot = f32::cast_from(F::cast_from(plane_sum(dot)));
         let score = f32::cast_from(F::cast_from(rounded_dot * scale));
         denominator += (score - maximum).exp();
@@ -282,17 +282,17 @@ fn gqa_decode_attention_kernel<F: Float>(
         let key_offset = kv_offset + sequence_index * head_dimension;
         let mut dot = 0.0f32;
         dot += query_0 * f32::cast_from(key[key_offset + lane]);
-        dot += query_1 * f32::cast_from(key[key_offset + lane + CUBE_DIM_X as usize]);
+        dot += query_1 * f32::cast_from(key[key_offset + lane + RUDA_DIM_X as usize]);
         let rounded_dot = f32::cast_from(F::cast_from(plane_sum(dot)));
         let score = f32::cast_from(F::cast_from(rounded_dot * scale));
         let probability = f32::cast_from(F::cast_from((score - maximum).exp() / denominator));
         accumulator_0 += probability * f32::cast_from(value[key_offset + lane]);
         accumulator_1 +=
-            probability * f32::cast_from(value[key_offset + lane + CUBE_DIM_X as usize]);
+            probability * f32::cast_from(value[key_offset + lane + RUDA_DIM_X as usize]);
     }
 
     output[query_offset + lane] = F::cast_from(accumulator_0);
-    output[query_offset + lane + CUBE_DIM_X as usize] = F::cast_from(accumulator_1);
+    output[query_offset + lane + RUDA_DIM_X as usize] = F::cast_from(accumulator_1);
 }
 
 pub(crate) fn rms_norm<R, F, I, BT, const D: usize>(
@@ -331,8 +331,8 @@ where
     let client = input.client.clone();
     rms_norm_kernel::launch::<R>(
         &client,
-        CubeCount::Static(rows as u32, 1, 1),
-        CubeDim::new_1d(32),
+        RudaCount::Static(rows as u32, 1, 1),
+        RudaDim::new_1d(32),
         input.into_array_arg(),
         gamma.into_array_arg(),
         output.clone().into_array_arg(),
@@ -388,8 +388,8 @@ where
 
     residual_rms_norm_kernel::launch::<R>(
         &client,
-        CubeCount::Static(rows as u32, 1, 1),
-        CubeDim::new_1d(32),
+        RudaCount::Static(rows as u32, 1, 1),
+        RudaDim::new_1d(32),
         residual.into_tensor_arg(),
         update.into_tensor_arg(),
         gamma.into_array_arg(),
@@ -432,15 +432,15 @@ where
         output_shape,
         gate_up.dtype,
     );
-    let cube_dim = CubeDim::new(gate_up.client.properties(), output.meta.num_elements());
-    let cube_count =
-        calculate_cube_count_elemwise(&gate_up.client, output.meta.num_elements(), cube_dim);
+    let ruda_dim = RudaDim::new(gate_up.client.properties(), output.meta.num_elements());
+    let ruda_count =
+        calculate_ruda_count_elemwise(&gate_up.client, output.meta.num_elements(), ruda_dim);
 
     let client = gate_up.client.clone();
     swiglu_kernel::launch::<R>(
         &client,
-        cube_count,
-        cube_dim,
+        ruda_count,
+        ruda_dim,
         gate_up.into_array_arg(),
         output.clone().into_array_arg(),
         width as u32,
@@ -505,14 +505,14 @@ where
     let query = make_output(Shape::new([batch, query_heads, sequence, head_dimension]));
     let kv_elements = batch * kv_heads * sequence * head_dimension;
     let elements = query.meta.num_elements() + 2 * kv_elements;
-    let cube_dim = CubeDim::new(projected.client.properties(), elements);
-    let cube_count = calculate_cube_count_elemwise(&projected.client, elements, cube_dim);
+    let ruda_dim = RudaDim::new(projected.client.properties(), elements);
+    let ruda_count = calculate_ruda_count_elemwise(&projected.client, elements, ruda_dim);
     let client = projected.client.clone();
 
     qkv_half_split_rope_kernel::launch::<R>(
         &client,
-        cube_count,
-        cube_dim,
+        ruda_count,
+        ruda_dim,
         projected.into_tensor_arg(),
         frequencies.into_tensor_arg(),
         query.clone().into_array_arg(),
@@ -573,8 +573,8 @@ where
     let client = query.client.clone();
     gqa_decode_attention_kernel::launch::<R>(
         &client,
-        CubeCount::Static((batch * query_heads) as u32, 1, 1),
-        CubeDim::new_1d(32),
+        RudaCount::Static((batch * query_heads) as u32, 1, 1),
+        RudaDim::new_1d(32),
         query.into_array_arg(),
         key.into_array_arg(),
         value.into_array_arg(),
