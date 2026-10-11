@@ -301,7 +301,7 @@ where
             );
             let logits = model.try_forward_cached_last(input, &mut cache)?;
             B::sync(device).map_err(error)?;
-            let prefix = PrefilledPrompt {
+            let prefix: PrefilledPrompt<B, M> = PrefilledPrompt {
                 model_id: self.model_id.clone(),
                 limits: self.limits,
                 tokens: prompt[..end].to_vec(),
@@ -555,7 +555,7 @@ where
             || tokens
                 .iter()
                 .any(|&t| t < 0 || t as usize >= limits.vocab_size)
-            || logits.shape != [1, 1, limits.vocab_size]
+            || logits.shape.as_slice() != [1, 1, limits.vocab_size]
             || !matches!(
                 logits.dtype,
                 ruda_tensor::api::DType::F16

@@ -553,7 +553,7 @@ fn check_pending(
         Some(data)
             if rows > 0
                 && width > 0
-                && data.shape == [1, rows, width]
+                && data.shape.as_slice() == [1, rows, width]
                 && matches!(data.dtype, DType::F16 | DType::BF16 | DType::F32)
                 && rows
                     .checked_mul(width)

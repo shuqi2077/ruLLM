@@ -151,7 +151,7 @@ fn invalid(reason: impl std::fmt::Display) -> RecorderError {
     RecorderError::Unknown(format!("invalid MLA continuation: {reason}"))
 }
 fn validate_payload(data: &TensorData, position: usize, width: usize) -> Result<(), RecorderError> {
-    if data.shape != [1, 1, position, width]
+    if data.shape.as_slice() != [1, 1, position, width]
         || !matches!(data.dtype, DType::F32 | DType::BF16 | DType::F16)
         || position
             .checked_mul(width)
