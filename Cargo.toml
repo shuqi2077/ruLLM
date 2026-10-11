@@ -17,7 +17,8 @@ amd = ["dep:ruda-driver-hip", "ruda-tensor/hip", "ruda-tensor-device/autotune"]
 nvidia = ["ruda-tensor-device/cuda", "ruda-tensor-device/autotune", "dep:ruda-driver-cuda"]
 nvidia-ptx = ["nvidia", "ruda-driver-cuda/direct-ptx"]
 serving = ["dep:axum", "dep:tokio", "dep:async-stream", "dep:minijinja", "dep:minijinja-contrib"]
-tensor-parallel = ["ruda-tensor/distributed", "ruda-tensor-device/distributed"]
+libtorch = ["dep:ruda-tensor-tch", "dep:tch"]
+tensor-parallel = ["ruda-tensor/distributed", "ruda-tensor-device/distributed", "ruda-tensor-tch?/distributed"]
 expert-parallel = ["tensor-parallel"]
 
 [dependencies]
@@ -26,6 +27,8 @@ ruda-model = { version = "0.21.58", path = "../ruda-model", default-features = f
 ruda-nn = { version = "0.21.67", path = "../ruda-nn", default-features = false, features = ["std"] }
 ruda-tensor = { version = "0.21.59", path = "../ruda-tensor", default-features = false, features = ["std", "kernel"] }
 ruda-tensor-device = { version = "0.21.59", path = "../ruda-tensor-device", default-features = false, features = ["std", "fusion"] }
+ruda-tensor-tch = { version = "0.21.72", path = "../ruda-tensor-tch", optional = true }
+tch = { version = "0.22.0", optional = true }
 ruda-store = { version = "0.21.57", path = "../ruda-store", default-features = false, features = ["std", "safetensors", "memmap"] }
 ruda-kernel = { version = "0.1.35", path = "../ruda-kernel", default-features = false, features = ["frontend-std", "library"] }
 ruda-core = { version = "0.1.6", path = "../ruda-core", default-features = false, features = ["std", "ir", "tensor"] }
@@ -55,7 +58,7 @@ workspace = true
 [[bin]]
 name = "ruda-serve"
 path = "src/bin/ruda-serve.rs"
-required-features = ["serving", "nvidia"]
+required-features = ["serving"]
 
 [[example]]
 name = "qwen2_generate"

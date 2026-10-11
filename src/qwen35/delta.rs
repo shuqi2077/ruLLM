@@ -14,7 +14,7 @@ pub(super) struct Delta<B: Backend> {
     pub norm: Tensor<B, 1>,
 }
 
-fn causal_convolution<B: Backend>(
+pub(super) fn causal_convolution<B: Backend>(
     history: Tensor<B, 3>, weight: Tensor<B, 3>, sequence: usize,
 ) -> Tensor<B, 3> {
     let [batch, channels, _] = history.dims();

@@ -22,7 +22,7 @@ pub(super) fn mask_floor(dtype: DType) -> f32 {
 use crate::gpu_inference::{gqa_scores, gqa_value_product_with};
 
 // Operations are supplied by the existing device backend, not a model-specific kernel.
-fn shared_tensor_ops<B: Backend>() -> crate::gpu_inference::TensorOps<Tensor<B, 4>> {
+pub(super) fn shared_tensor_ops<B: Backend>() -> crate::gpu_inference::TensorOps<Tensor<B, 4>> {
     crate::gpu_inference::TensorOps {
         shape: |t| t.dims(),
         reshape: |t, dims| t.reshape(dims),
@@ -36,7 +36,7 @@ fn shared_tensor_ops<B: Backend>() -> crate::gpu_inference::TensorOps<Tensor<B, 
 #[path = "../gpu_inference_tensor_tests.rs"]
 mod shared_attention_tests;
 
-fn causal_mask<B: Backend>(
+pub(super) fn causal_mask<B: Backend>(
     sequence: usize,
     position: usize,
     key_length: usize,

@@ -6,6 +6,10 @@ pub use cache_record::{Qwen35CacheRecord,Qwen35LayerCacheState};
 mod config;
 mod delta;
 mod layer;
+#[cfg(feature = "libtorch")]
+mod libtorch;
+#[cfg(feature = "libtorch")]
+mod libtorch_delta;
 mod loading;
 mod quantized_loading;
 mod projection;
