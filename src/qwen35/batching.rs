@@ -252,7 +252,7 @@ where
                 }
             };
             hidden = hidden + update;
-            hidden = hidden.clone() + layer.mlp.forward(layer.post_norm.forward(hidden)?);
+            hidden = hidden.clone() + layer.mlp.forward(layer.post_norm.forward(hidden)?)?;
         }
         for row in &batch.sequences {
             let state = cache.requests.get_mut(&row.request_id).unwrap();

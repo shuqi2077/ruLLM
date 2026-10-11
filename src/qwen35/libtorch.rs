@@ -5,6 +5,15 @@ use ruda_tensor_tch::{LibTorch, TchElement};
 
 type Torch<E> = LibTorch<E>;
 
+impl<E: TchElement> Mlp<Torch<E>> {
+    fn forward(&self, input: Tensor<Torch<E>, 3>) -> Tensor<Torch<E>, 3> {
+        let gate = self.gate.forward(input.clone());
+        let dtype = gate.dtype();
+        self.down
+            .forward(silu(gate.cast(DType::F32)).cast(dtype) * self.up.forward(input))
+    }
+}
+
 impl<E: TchElement> Norm<Torch<E>> {
     fn forward<const D: usize>(
         &self,

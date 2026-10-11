@@ -135,7 +135,7 @@ fn real_checkpoint_multimodal_layer_diagnosis() {
             compare("mixer0",update.clone().cast(DType::F32).into_data().to_vec().unwrap());
             let post = layer.post_norm.forward(hidden.clone()+update).unwrap();
             compare("post0",post.clone().cast(DType::F32).into_data().to_vec().unwrap());
-            compare("mlp0",layer.mlp.forward(post).cast(DType::F32).into_data().to_vec().unwrap());
+            compare("mlp0",layer.mlp.forward(post).unwrap().cast(DType::F32).into_data().to_vec().unwrap());
         }
     }
     let (cos,sin) = attention::multimodal_rope::<B>(&model.text.config,&positions.coordinates,1,prompt.len(),hidden.dtype(),&device).unwrap();

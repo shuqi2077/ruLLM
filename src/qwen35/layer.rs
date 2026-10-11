@@ -21,6 +21,6 @@ where
             _ => return Err(GenerationError("Qwen3.5 cache layer type mismatch".into())),
         };
         let hidden = hidden+update;
-        Ok(hidden.clone()+self.mlp.forward(self.post_norm.forward(hidden)?))
+        Ok(hidden.clone()+self.mlp.forward(self.post_norm.forward(hidden)?)?)
     }
 }

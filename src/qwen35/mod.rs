@@ -59,12 +59,19 @@ struct Mlp<B: Backend> {
     up: Projection<B>,
     down: Projection<B>,
 }
-impl<B: Backend> Mlp<B> {
-    fn forward(&self, input: Tensor<B, 3>) -> Tensor<B, 3> {
+impl<R, F, I, BT> Mlp<DeviceBackend<R, F, I, BT>>
+where
+    R: DeviceRuntime, R::Server: ComputeServer, R::Device: DeviceOps,
+    F: FloatElement, I: IntElement, BT: BoolElement,
+{
+    fn forward(&self, input: Tensor<DeviceBackend<R, F, I, BT>, 3>)
+        -> Result<Tensor<DeviceBackend<R, F, I, BT>, 3>, GenerationError>
+    {
         let gate = self.gate.forward(input.clone());
-        let dtype = gate.dtype();
-        self.down
-            .forward(silu(gate.cast(DType::F32)).cast(dtype) * self.up.forward(input))
+        let up = self.up.forward(input);
+        let activated = ruda_tensor::api::activation::swiglu_native(gate, up)
+            .map_err(|error| GenerationError(error.to_string()))?;
+        Ok(self.down.forward(activated))
     }
 }
 enum Mixer<B: Backend> {

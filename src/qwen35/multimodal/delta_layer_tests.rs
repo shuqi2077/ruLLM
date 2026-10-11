@@ -44,7 +44,7 @@ fn real_delta_layer_components() {
     let residual = hidden.clone()+update;
     let post = layer.post_norm.forward(residual.clone()).unwrap();
     compare("post norm","post0",post.clone());
-    let mlp = layer.mlp.forward(post);
+    let mlp = layer.mlp.forward(post).unwrap();
     compare("MLP","mlp0",mlp.clone());
     assert_eq!(compare("layer output","output",residual+mlp),0);
 
@@ -54,5 +54,5 @@ fn real_delta_layer_components() {
     assert_eq!(compare("fixed core gated norm","gated0",gated.reshape([batch,sequence,values])),0);
     compare("fixed gated output projection","mixer0",delta.out.forward(read("gated0",values,DType::BF16)));
     compare("fixed mixer post norm","post0",layer.post_norm.forward(hidden+read("mixer0",width,DType::BF16)).unwrap());
-    compare("fixed post MLP","mlp0",layer.mlp.forward(read("post0",width,DType::BF16)));
+    compare("fixed post MLP","mlp0",layer.mlp.forward(read("post0",width,DType::BF16)).unwrap());
 }
