@@ -91,6 +91,20 @@ impl<'a, B: Backend, M: DeviceBatchModel<B>> DeviceBatchExecutor<'a, B, M> {
     }
 
     pub fn step(&mut self) -> Result<Option<ExecutedBatch>, ContinuousBatchError> {
+        self.step_inner(None)
+    }
+
+    pub fn step_with_logits_processor(
+        &mut self,
+        mut processor: impl FnMut(RequestId, &mut [f32]) -> Result<(), GenerationError>,
+    ) -> Result<Option<ExecutedBatch>, ContinuousBatchError> {
+        self.step_inner(Some(&mut processor))
+    }
+
+    fn step_inner(
+        &mut self,
+        processor: Option<&mut dyn FnMut(RequestId, &mut [f32]) -> Result<(), GenerationError>>,
+    ) -> Result<Option<ExecutedBatch>, ContinuousBatchError> {
         let Some(batch) = self.scheduler.schedule()? else {
             return Ok(None);
         };
@@ -116,7 +130,17 @@ impl<'a, B: Backend, M: DeviceBatchModel<B>> DeviceBatchExecutor<'a, B, M> {
             .map_err(|e| ContinuousBatchError(format!("batch completion: {e}")))?;
         let selection = result
             .map_err(|e| ContinuousBatchError(e.to_string()))
-            .and_then(|values| {
+            .and_then(|mut values| {
+                if let Some(processor) = processor {
+                    for (sequence, row) in batch
+                        .sequences
+                        .iter()
+                        .zip(values.chunks_exact_mut(vocabulary))
+                    {
+                        processor(sequence.request_id, row)
+                            .map_err(|e| ContinuousBatchError(e.to_string()))?;
+                    }
+                }
                 self.scheduler
                     .select_batch_tokens(batch.id, &values, vocabulary)
             });

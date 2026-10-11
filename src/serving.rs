@@ -29,6 +29,16 @@ use std::{
 };
 use tokio::sync::{mpsc, oneshot};
 
+mod batch;
+mod images;
+mod metrics;
+mod progress;
+mod responses;
+pub mod structured;
+mod tool_calls;
+pub use batch::{BatchServingConfig, run_continuous_batch};
+pub use images::run_qwen35_multimodal;
+
 #[derive(Clone, Deserialize)]
 pub struct GenerateRequest {
     pub model: String,
@@ -60,6 +70,10 @@ pub struct GenerateRequest {
     pub tools: Option<Vec<Value>>,
     #[serde(default)]
     pub tool_choice: Option<Value>,
+    #[serde(default)]
+    pub response_format: Option<structured::ResponseFormat>,
+    #[serde(default)]
+    pub grammar: Option<structured::Grammar>,
     #[serde(flatten)]
     pub template_options: BTreeMap<String, Value>,
 }
@@ -101,12 +115,11 @@ impl GenerateRequest {
                     Some("system" | "user" | "assistant" | "tool")
                 ) || message
                     .get("content")
-                    .is_some_and(|v| !v.is_string() && !v.is_null())
+                    .is_some_and(|v| !v.is_string() && !v.is_null() && !v.is_array())
                 {
-                    return Err(
-                        "only text messages and function tool messages are supported".into(),
-                    );
+                    return Err("messages require supported roles and text or content parts".into());
                 }
+                images::validate_parts(message.get("content"))?;
                 if message.get("content").is_none_or(Value::is_null)
                     && message.get("tool_calls").is_none()
                 {
@@ -158,6 +171,7 @@ impl GenerateRequest {
             }
         }
         self.stops()?;
+        structured::validate(self)?;
         Ok(())
     }
 
@@ -210,6 +224,7 @@ pub fn render_chat(
         .add_template("chat", template)
         .map_err(|e| e.to_string())?;
     let mut messages = request.messages.clone().ok_or("messages are required")?;
+    images::normalize_messages(&mut messages)?;
     for message in &mut messages {
         if let Some(calls) = message.get_mut("tool_calls").and_then(Value::as_array_mut) {
             for call in calls {
@@ -248,6 +263,8 @@ pub struct ServerState {
     model: String,
     jobs: mpsc::Sender<Job>,
     sequence: Arc<AtomicU64>,
+    metrics: Arc<metrics::Metrics>,
+    responses_config: Option<responses::Config>,
 }
 
 pub struct Job {
@@ -257,6 +274,7 @@ pub struct Job {
     created: u64,
     ready: oneshot::Sender<Result<(), (StatusCode, String)>>,
     events: mpsc::Sender<Result<Value, String>>,
+    responses: Option<Arc<std::sync::Mutex<responses::Output>>>,
 }
 
 pub fn channel(
@@ -272,16 +290,45 @@ pub fn channel(
             model,
             jobs,
             sequence: Arc::new(AtomicU64::new(0)),
+            metrics: Arc::new(metrics::Metrics::default()),
+            responses_config: None,
         },
         receiver,
     ))
 }
 
 pub fn router(state: ServerState) -> Router {
-    Router::new()
+    router_with_images(state, false)
+}
+
+pub fn router_with_images(state: ServerState, image_inputs: bool) -> Router {
+    let metrics = state.metrics.clone();
+    let chat_route = if image_inputs {
+        post(chat).layer(axum::extract::DefaultBodyLimit::disable())
+    } else {
+        post(chat)
+    };
+    let responses_route = if image_inputs {
+        post(responses::create).layer(axum::extract::DefaultBodyLimit::disable())
+    } else {
+        post(responses::create)
+    };
+    let routes = Router::new()
         .route("/v1/models", get(models))
+        .route("/v1/codex/models", get(responses::models))
+        .route("/v1/responses", responses_route)
         .route("/v1/completions", post(completions))
-        .route("/v1/chat/completions", post(chat))
+        .route("/v1/chat/completions", chat_route)
+        .route("/metrics", get(metrics::endpoint))
+        .route(
+            "/ui",
+            get(|| async { axum::response::Html(include_str!("serving/ui.html")) }),
+        );
+    routes
+        .layer(axum::middleware::from_fn_with_state(
+            metrics,
+            metrics::record,
+        ))
         .with_state(state)
 }
 
@@ -312,10 +359,19 @@ fn api_error(status: StatusCode, message: String) -> Response {
     (status,Json(json!({"error":{"message":message,"type":if status.is_client_error(){"invalid_request_error"}else{"server_error"},"param":null,"code":null}}))).into_response()
 }
 async fn submit(state: ServerState, request: GenerateRequest, chat: bool) -> Response {
+    submit_wire(state, request, chat, None).await
+}
+async fn submit_wire(
+    state: ServerState,
+    request: GenerateRequest,
+    chat: bool,
+    responses: Option<responses::Output>,
+) -> Response {
     if let Err(e) = request.validate(&state.model, chat) {
         return api_error(StatusCode::BAD_REQUEST, e);
     }
     let stream = request.stream;
+    let responses_wire = responses.is_some();
     let serial = state.sequence.fetch_add(1, Ordering::Relaxed);
     let created = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -323,7 +379,13 @@ async fn submit(state: ServerState, request: GenerateRequest, chat: bool) -> Res
         .as_secs();
     let id = format!(
         "{}-{}-{created}-{serial}",
-        if chat { "chatcmpl" } else { "cmpl" },
+        if responses_wire {
+            "resp"
+        } else if chat {
+            "chatcmpl"
+        } else {
+            "cmpl"
+        },
         std::process::id()
     );
     let (ready, prepared) = oneshot::channel();
@@ -337,6 +399,7 @@ async fn submit(state: ServerState, request: GenerateRequest, chat: bool) -> Res
             created,
             ready,
             events,
+            responses: responses.map(|output| Arc::new(std::sync::Mutex::new(output))),
         })
         .await
         .is_err()
@@ -359,10 +422,12 @@ async fn submit(state: ServerState, request: GenerateRequest, chat: bool) -> Res
     if stream {
         let output = async_stream::stream! {
             while let Some(event)=receiver.recv().await {
-                let value=match event {Ok(value)=>value,Err(message)=>json!({"error":{"message":message,"type":"server_error"}})};
-                yield Ok::<Event,Infallible>(Event::default().data(value.to_string()));
+                let value=match event {Ok(value)=>value,Err(message)=>if responses_wire {json!({"type":"response.failed","response":{"status":"failed","error":{"message":message,"code":"server_error"}}})}else{json!({"error":{"message":message,"type":"server_error"}})}};
+                let mut event = Event::default();
+                if responses_wire {if let Some(kind)=value.get("type").and_then(Value::as_str){event=event.event(kind);}}
+                yield Ok::<Event,Infallible>(event.data(value.to_string()));
             }
-            yield Ok::<Event,Infallible>(Event::default().data("[DONE]"));
+            if !responses_wire {yield Ok::<Event,Infallible>(Event::default().data("[DONE]"));}
         };
         Sse::new(output).into_response()
     } else {
@@ -411,8 +476,14 @@ pub fn parse_tool_calls(
         let end = tail
             .find("</tool_call>")
             .ok_or("unterminated model tool call")?;
-        let call: Value = serde_json::from_str(tail[..end].trim())
-            .map_err(|e| format!("invalid model tool call: {e}"))?;
+        let body = tail[..end].trim();
+        let call: Value = if body.starts_with("<function=") {
+            let (name, arguments) =
+                tool_calls::xml_prefix(body, tools, true)?.ok_or("incomplete XML tool call")?;
+            json!({"name":name,"arguments":serde_json::from_str::<Value>(&arguments).map_err(|e|e.to_string())?})
+        } else {
+            serde_json::from_str(body).map_err(|e| format!("invalid model tool call: {e}"))?
+        };
         let name = call
             .get("name")
             .and_then(Value::as_str)
@@ -452,6 +523,23 @@ fn safe_text_end(text: &str, stops: &[String]) -> usize {
         .max()
         .unwrap_or(0);
     text.len() - held
+}
+
+fn ignored_tool_tokens(
+    tokenizer: &tokenizers::Tokenizer,
+    tools: bool,
+) -> std::collections::BTreeSet<u32> {
+    if !tools {
+        return Default::default();
+    }
+    tokenizer
+        .get_added_tokens_decoder()
+        .into_iter()
+        .filter_map(|(id, token)| {
+            (token.special && token.content != "<tool_call>" && token.content != "</tool_call>")
+                .then_some(id)
+        })
+        .collect()
 }
 
 pub fn run_native<B: Backend, M: CausalModel<B>>(
@@ -509,6 +597,14 @@ where
         if job.events.is_closed() {
             continue;
         }
+        if images::has_images(&job.request) {
+            let _ = job.ready.send(Err((
+                StatusCode::BAD_REQUEST,
+                "this worker is text-only; enable --multimodal for native Qwen3.5 image input"
+                    .into(),
+            )));
+            continue;
+        }
         let prompt = if job.chat {
             let template = tokenizer_config
                 .get("chat_template")
@@ -542,6 +638,13 @@ where
                 continue;
             }
         };
+        let eos = match progress::eos_ids(job.chat, &eos, &tokenizer, &tokenizer_config) {
+            Ok(eos) => eos,
+            Err(error) => {
+                let _ = job.ready.send(Err((StatusCode::BAD_REQUEST, error)));
+                continue;
+            }
+        };
         let max = job
             .request
             .max_tokens
@@ -569,6 +672,13 @@ where
                 .send(Err((StatusCode::BAD_REQUEST, e.to_string())));
             continue;
         }
+        let constraint = match structured::Decoder::new(&job.request, &tokenizer, &eos) {
+            Ok(constraint) => constraint,
+            Err(error) => {
+                let _ = job.ready.send(Err((StatusCode::BAD_REQUEST, error)));
+                continue;
+            }
+        };
         let prefix = if max == 0 {
             Ok(None)
         } else if let Some(remote) = &remote_prefill {
@@ -608,6 +718,7 @@ where
             id,
             created,
             events,
+            responses,
         } = job;
         if ready.send(Ok(())).is_err() {
             continue;
@@ -620,10 +731,16 @@ where
             id,
             created,
             events,
+            responses,
         };
-        if let Err(e) =
-            generate_response::<B, M>(&job, &mut session, &tokenizer, &device, ids.len())
-        {
+        if let Err(e) = generate_response::<B, M>(
+            &job,
+            &mut session,
+            &tokenizer,
+            &device,
+            ids.len(),
+            constraint,
+        ) {
             let _ = job.events.blocking_send(Err(e));
         }
     }
@@ -636,32 +753,39 @@ fn generate_response<B: Backend, M: CausalModel<B>>(
     tokenizer: &tokenizers::Tokenizer,
     device: &B::Device,
     prompt_tokens: usize,
+    mut constraint: Option<structured::Decoder>,
 ) -> Result<(), String> {
     let stops = job.request.stops()?;
     let tools = job.request.tools_enabled();
-    let mut decoder = tokenizer.decode_stream(true);
+    let ignored = ignored_tool_tokens(tokenizer, tools);
+    let mut decoder = tokenizer.decode_stream(!tools);
     let mut text = String::new();
     let mut emitted = 0;
     let mut stopped = false;
-    if job.request.stream && job.chat {
+    if job.responses.is_some() {
+        responses::begin(job)?;
+    } else if job.request.stream && job.chat {
         job.events.blocking_send(Ok(chunk(job,json!({"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null,"logprobs":null}),None)))
             .map_err(|e|e.to_string())?;
     }
     while !job.events.is_closed() {
-        let Some(step) = session.step().map_err(|e| e.to_string())? else {
+        let Some(step) = structured::step(session, &mut constraint).map_err(|e| e.to_string())?
+        else {
             break;
         };
-        if let Some(piece) = decoder
-            .step(u32::try_from(step.token_id).map_err(|e| e.to_string())?)
-            .map_err(|e| e.to_string())?
-        {
-            text.push_str(&piece);
+        let token_id = u32::try_from(step.token_id).map_err(|e| e.to_string())?;
+        if !ignored.contains(&token_id) {
+            if let Some(piece) = decoder.step(token_id).map_err(|e| e.to_string())? {
+                text.push_str(&piece);
+            }
         }
         if let Some(end) = stops.iter().filter_map(|stop| text.find(stop)).min() {
             text.truncate(end);
             stopped = true;
         }
-        if job.request.stream && !tools {
+        if job.responses.is_some() && job.request.stream {
+            emitted = responses::advance(job, &text, stopped)?;
+        } else if job.request.stream && !tools {
             let end = if stopped {
                 text.len()
             } else {
@@ -684,8 +808,11 @@ fn generate_response<B: Backend, M: CausalModel<B>>(
             .generated_token_ids
             .iter()
             .map(|&id| u32::try_from(id).map_err(|e| e.to_string()))
-            .collect::<Result<Vec<_>, _>>()?;
-        let complete = tokenizer.decode(&ids, true).map_err(|e| e.to_string())?;
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter(|id| !ignored.contains(id))
+            .collect::<Vec<_>>();
+        let complete = tokenizer.decode(&ids, !tools).map_err(|e| e.to_string())?;
         if !complete.starts_with(&text[..emitted]) {
             return Err("final tokenizer output differs from emitted stream prefix".into());
         }
@@ -702,6 +829,27 @@ fn generate_response<B: Backend, M: CausalModel<B>>(
     if job.events.is_closed() {
         return Ok(());
     }
+    finish_response(
+        job,
+        text,
+        emitted,
+        stopped,
+        session.finish_reason(),
+        prompt_tokens,
+        session.generated_tokens(),
+    )
+}
+
+fn finish_response(
+    job: &Job,
+    text: String,
+    emitted: usize,
+    stopped: bool,
+    reason: Option<GenerationFinishReason>,
+    prompt_tokens: usize,
+    generated_tokens: usize,
+) -> Result<(), String> {
+    let tools = job.request.tools_enabled();
     let (content, calls) = if tools {
         parse_tool_calls(&text, job.request.tools.as_deref().unwrap_or(&[]), &job.id)?
     } else {
@@ -731,15 +879,15 @@ fn generate_response<B: Backend, M: CausalModel<B>>(
         "tool_calls"
     } else if stopped {
         "stop"
-    } else if matches!(
-        session.finish_reason(),
-        Some(GenerationFinishReason::MaxNewTokens)
-    ) {
+    } else if matches!(reason, Some(GenerationFinishReason::MaxNewTokens)) {
         "length"
     } else {
         "stop"
     };
-    let usage = json!({"prompt_tokens":prompt_tokens,"completion_tokens":session.generated_tokens(),"total_tokens":prompt_tokens+session.generated_tokens()});
+    let usage = json!({"prompt_tokens":prompt_tokens,"completion_tokens":generated_tokens,"total_tokens":prompt_tokens+generated_tokens});
+    if job.responses.is_some() {
+        return responses::finish(job, &text, finish, prompt_tokens, generated_tokens);
+    }
     if job.request.stream {
         if tools {
             if !content.is_empty() {

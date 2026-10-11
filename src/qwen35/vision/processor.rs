@@ -53,7 +53,7 @@ fn product(factors: &[usize]) -> Result<usize, GenerationError> {
 }
 
 impl Qwen35ImageProcessor {
-    pub(in crate::qwen35) fn validate_vision(&self, vision: &super::Qwen35VisionConfig) -> Result<(), GenerationError> {
+    pub fn validate_vision(&self, vision: &super::Qwen35VisionConfig) -> Result<(), GenerationError> {
         if vision.in_channels != 3 || self.config.patch_size != vision.patch_size
             || self.config.temporal_patch_size != vision.temporal_patch_size
             || self.config.merge_size != vision.spatial_merge_size

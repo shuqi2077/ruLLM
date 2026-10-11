@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="zh"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>RUDA Chat</title>
+<style>body{font:16px system-ui;max-width:900px;margin:30px auto;padding:0 16px;background:#111827;color:#e5e7eb}textarea{width:100%;box-sizing:border-box;min-height:100px}textarea,select,button,input{font:inherit;padding:8px;border-radius:6px}article{white-space:pre-wrap;overflow-wrap:anywhere;padding:14px;margin:12px 0;background:#1f2937;border-radius:8px}label{display:inline-block;margin:8px 12px 8px 0}#status{color:#93c5fd}button{cursor:pointer}</style>
+<h1>RUDA Chat</h1><label>模型 <select id="model"></select></label>
+<label>最大新 token <input id="tokens" type="number" min="0" value="256"></label>
+<label>温度 <input id="temperature" type="number" min="0" max="2" step="0.1" value="0.7"></label>
+<div id="chat"></div><form id="form"><textarea id="prompt" required placeholder="输入消息"></textarea>
+<label>图片 <input id="images" type="file" accept="image/png,image/jpeg" multiple></label>
+<button id="send">发送</button><button id="stop" type="button" disabled>停止</button>
+<button id="clear" type="button">新对话</button></form><p id="status"></p>
+<script>
+const element=id=>document.getElementById(id);let messages=[],controller=null;
+const status=text=>element('status').textContent=text;
+function article(role,text){const node=document.createElement('article');node.textContent=role+'：\n'+text;element('chat').append(node);return node;}
+const dataURL=file=>new Promise((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(reader.result);reader.onerror=()=>reject(reader.error);reader.readAsDataURL(file);});
+fetch('/v1/models').then(r=>r.json()).then(v=>{for(const model of v.data){const option=document.createElement('option');option.value=option.textContent=model.id;element('model').append(option);}}).catch(e=>status(e.message));
+element('stop').onclick=()=>controller?.abort();
+element('clear').onclick=()=>{if(controller)return;messages=[];element('chat').replaceChildren();status('');};
+element('form').onsubmit=async event=>{
+ event.preventDefault();if(controller)return;
+ const prompt=element('prompt').value;const files=[...element('images').files];
+ let content=prompt;
+ try{if(files.length)content=[{type:'text',text:prompt},...await Promise.all(files.map(async file=>({type:'image_url',image_url:{url:await dataURL(file)}})))];}catch(error){status(error.message);return;}
+ messages.push({role:'user',content});article('user',prompt+(files.length?'\n'+files.map(f=>f.name).join(', '):''));
+ const output=article('assistant','');let text='',calls=[],complete=false;controller=new AbortController();element('send').disabled=true;element('stop').disabled=false;status('生成中');
+ try{
+  const response=await fetch('/v1/chat/completions',{method:'POST',headers:{'Content-Type':'application/json'},signal:controller.signal,body:JSON.stringify({model:element('model').value,messages,max_tokens:Number(element('tokens').value),temperature:Number(element('temperature').value),stream:true,stream_options:{include_usage:true}})});
+  if(!response.ok){const error=await response.json();throw Error(error.error?.message||response.statusText);}
+  const reader=response.body.getReader(),decoder=new TextDecoder();let buffer='';
+  for(;;){const {done,value}=await reader.read();buffer+=decoder.decode(value,{stream:!done});let end;
+   while((end=buffer.indexOf('\n\n'))>=0){const block=buffer.slice(0,end);buffer=buffer.slice(end+2);const payload=block.split('\n').filter(line=>line.startsWith('data:')).map(line=>line.slice(5).trimStart()).join('\n');if(!payload)continue;if(payload==='[DONE]'){complete=true;continue;}
+    const part=JSON.parse(payload);if(part.error)throw Error(part.error.message);const delta=part.choices?.[0]?.delta;if(delta?.content){text+=delta.content;output.textContent='assistant：\n'+text;}if(delta?.tool_calls)calls.push(...delta.tool_calls);if(part.usage)status('输入 '+part.usage.prompt_tokens+' / 输出 '+part.usage.completion_tokens+' token');
+   }if(done)break;
+  }
+  if(!complete)throw Error('流在完成标记之前结束');
+  const reply={role:'assistant',content:text};if(calls.length){reply.tool_calls=calls;output.textContent+='\n'+JSON.stringify(calls,null,2);}messages.push(reply);element('prompt').value='';element('images').value='';if(!element('status').textContent.includes('token'))status('完成');
+ }catch(error){status(error.name==='AbortError'?'已停止':error.message);if(text)messages.push({role:'assistant',content:text});}
+ finally{controller=null;element('send').disabled=false;element('stop').disabled=true;}
+};
+</script></html>

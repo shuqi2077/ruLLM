@@ -13,6 +13,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut model_id = None;
     let mut address = "127.0.0.1:8000".to_string();
     let mut queue_capacity = 64;
+    let mut responses_max_output_tokens = None;
+    let mut autotune_cache_directory = None;
     let mut device_indices = vec![0usize];
     let mut backend = "native".to_string();
     let mut libtorch_device = "cuda".to_string();
@@ -22,6 +24,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut mla_mode = DeepseekV2AttentionMode::Expanded;
     let mut draft_directory = None;
     let mut draft_id = None;
+    let mut multimodal = false;
+    let mut batch_sequences = None;
+    let mut batch_tokens = None;
+    let mut batch_pages = None;
+    let mut batch_block = None;
     let mut config = PrefixCacheConfig {
         block_tokens: 64,
         device_entries: 4,
@@ -32,9 +39,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
     while let Some(arg) = args.next() {
         if arg == "--help" {
             println!(
-                "ruda-serve --model-path DIR --model-id EXACT-WEIGHTS-IDENTITY [--served-model-name NAME] [--backend native|libtorch (default native; libtorch feature required)] [--libtorch-device cpu|cuda|mps (default cuda)] [--devices 0,1 (Qwen3 TP / DeepSeek-V2 EP)] [--draft-model-path DIR --draft-model-id EXACT-DRAFT-IDENTITY (single-device Qwen3 DFlash/DSpark)] [--mla-mode expanded|absorbed (DeepSeek-V2 only; default expanded)] [--role integrated|prefill|decode] [--prefill-address HOST:PORT (prefill listen/decode connect, TCP host KV)] [--bind 127.0.0.1:8000] [--queue-capacity N] [--prefix-block-tokens N] [--prefix-device-entries N] [--kv-host-bytes N] [--kv-disk-directory DIR --kv-disk-bytes N]"
+                "ruda-serve --model-path DIR --model-id EXACT-WEIGHTS-IDENTITY [--served-model-name NAME] [--backend native|libtorch (default native; libtorch feature required)] [--libtorch-device cpu|cuda|mps (default cuda)] [--devices 0,1 (Qwen3 TP / DeepSeek-V2 EP)] [--draft-model-path DIR --draft-model-id EXACT-DRAFT-IDENTITY (single-device Qwen3 DFlash/DSpark)] [--mla-mode expanded|absorbed (DeepSeek-V2 only; default expanded)] [--role integrated|prefill|decode] [--prefill-address HOST:PORT (prefill listen/decode connect, TCP host KV)] [--bind 127.0.0.1:8000] [--queue-capacity N] [--multimodal (native Qwen3.5 JPEG/PNG; single-device integrated)] [--batch-max-sequences N --batch-max-tokens N --batch-kv-pages N --batch-block-tokens N (native Qwen3.5 text; single-device integrated; no prefix/offload/image batching)] [--prefix-block-tokens N] [--prefix-device-entries N] [--kv-host-bytes N] [--kv-disk-directory DIR --kv-disk-bytes N]"
+            );
+            println!(
+                "[structured-output feature: response_format JSON Schema/JSON object or grammar regex/Lark/llguidance; standard or continuous-batch serving]"
+            );
+            println!(
+                "[Codex: --responses-max-output-tokens N enables /v1/responses and /v1/codex/models; checkpoint context window, stateless HTTP tool replay]"
+            );
+            println!(
+                "[native stack-autotune feature: --autotune-cache-directory DIR enables Explore with the default validated policy and persistent tuning records]"
             );
             return Ok(());
+        }
+        if arg == "--multimodal" {
+            multimodal = true;
+            continue;
         }
         let value = args
             .next()
@@ -43,6 +63,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             "--model-path" => directory = Some(PathBuf::from(value)),
             "--model-id" => model_id = Some(value),
             "--served-model-name" => model_name = Some(value),
+            "--autotune-cache-directory" => autotune_cache_directory = Some(PathBuf::from(value)),
             "--bind" => address = value,
             "--backend" => backend = value,
             "--libtorch-device" => {
@@ -65,6 +86,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 }
             }
             "--queue-capacity" => queue_capacity = value.parse()?,
+            "--responses-max-output-tokens" => {
+                responses_max_output_tokens = Some(value.parse::<usize>()?)
+            }
+            "--batch-max-sequences" => batch_sequences = Some(value.parse::<usize>()?),
+            "--batch-max-tokens" => batch_tokens = Some(value.parse::<usize>()?),
+            "--batch-kv-pages" => batch_pages = Some(value.parse::<usize>()?),
+            "--batch-block-tokens" => batch_block = Some(value.parse::<usize>()?),
             "--devices" => {
                 device_indices = value.split(',').map(str::parse).collect::<Result<_, _>>()?
             }
@@ -143,6 +171,68 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let draft_directory = draft_directory
         .map(|directory| directory.canonicalize())
         .transpose()?;
+    let batch = if let Some(max_sequences) = batch_sequences {
+        Some(serving::BatchServingConfig {
+            max_sequences,
+            max_batch_tokens: batch_tokens.ok_or_else(|| {
+                io::Error::other("--batch-max-tokens is required for batch serving")
+            })?,
+            kv_pages: batch_pages.ok_or_else(|| {
+                io::Error::other("--batch-kv-pages is required for batch serving")
+            })?,
+            block_tokens: batch_block.unwrap_or(64),
+            max_queued_requests: queue_capacity,
+        })
+    } else {
+        if batch_tokens.is_some() || batch_pages.is_some() || batch_block.is_some() {
+            return Err(io::Error::other("batch options require --batch-max-sequences").into());
+        }
+        None
+    };
+    if (multimodal || batch.is_some())
+        && (backend != "native" || role != "integrated" || device_indices.len() != 1)
+    {
+        return Err(io::Error::other(
+            "batch/image serving currently requires single-device integrated native CUDA",
+        )
+        .into());
+    }
+    if multimodal && batch.is_some() {
+        return Err(io::Error::other(
+            "combined image and continuous-batch serving is not implemented",
+        )
+        .into());
+    }
+    if batch.is_some_and(|batch| {
+        batch.max_sequences == 0
+            || batch.max_batch_tokens == 0
+            || batch.kv_pages == 0
+            || batch.block_tokens == 0
+            || batch.max_queued_requests == 0
+    }) {
+        return Err(io::Error::other("batch limits and queue capacity must be positive").into());
+    }
+    if batch.is_some()
+        && (config.host_bytes != 0 || config.disk_bytes != 0 || config.disk_directory.is_some())
+    {
+        return Err(io::Error::other("batch KV offload is not implemented; host/SSD tiers remain available in standard serving").into());
+    }
+    if let Some(directory) = autotune_cache_directory {
+        #[cfg(feature = "stack-autotune")]
+        ruda::runtime::tune::stack::enable_stack_autotune(
+            ruda::runtime::tune::stack::StackPolicy::default(),
+            Some(directory),
+        )
+        .map_err(|error| io::Error::other(error.to_string()))?;
+        #[cfg(not(feature = "stack-autotune"))]
+        {
+            let _ = directory;
+            return Err(io::Error::other(
+                "--autotune-cache-directory requires the stack-autotune feature",
+            )
+            .into());
+        }
+    }
     let model_name = model_name.unwrap_or_else(|| {
         directory
             .file_name()
@@ -150,7 +240,26 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .to_string_lossy()
             .into_owned()
     });
-    let (state, jobs) = serving::channel(model_name, queue_capacity).map_err(io::Error::other)?;
+    let (mut state, jobs) =
+        serving::channel(model_name, queue_capacity).map_err(io::Error::other)?;
+    if let Some(max_output_tokens) = responses_max_output_tokens {
+        let checkpoint: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(directory.join("config.json"))?)?;
+        let text_config = checkpoint.get("text_config").unwrap_or(&checkpoint);
+        let context_window = text_config
+            .get("max_position_embeddings")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| {
+                io::Error::other("Responses requires checkpoint max_position_embeddings")
+            })?;
+        state = state
+            .with_responses(
+                usize::try_from(context_window)?,
+                max_output_tokens,
+                multimodal,
+            )
+            .map_err(io::Error::other)?;
+    }
     let (ready, loaded) = tokio::sync::oneshot::channel();
     let options = worker::Options {
         directory,
@@ -162,6 +271,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         draft_directory,
         draft_id,
         cache: config,
+        batch,
+        multimodal,
     };
     let worker_backend = backend.clone();
     let worker = std::thread::Builder::new()
@@ -184,6 +295,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
     let listener = tokio::net::TcpListener::bind(&address).await?;
     println!("RUDA {backend} model serving at http://{address}/v1");
-    axum::serve(listener, serving::router(state)).await?;
+    axum::serve(listener, serving::router_with_images(state, multimodal)).await?;
     Ok(())
 }

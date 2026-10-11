@@ -18,6 +18,8 @@ pub struct Options {
     pub draft_directory: Option<PathBuf>,
     pub draft_id: Option<String>,
     pub cache: PrefixCacheConfig,
+    pub batch: Option<serving::BatchServingConfig>,
+    pub multimodal: bool,
 }
 
 struct Worker {
@@ -82,9 +84,11 @@ pub fn run(
                         #[cfg(feature = "tensor-parallel")]
                         {
                             if libtorch_device != "cuda"
-                                || !ruda_tensor_tch::distributed::nccl_available()
+                                || !ruda_tensor_tch::distributed::peer_available()
                             {
-                                return Err("LibTorch TP/EP requires a Linux NCCL-enabled CUDA LibTorch build".into());
+                                return Err(
+                                    "LibTorch TP/EP requires the ruCCL CUDA peer adapter".into()
+                                );
                             }
                             let devices = worker
                                 .options
@@ -128,6 +132,17 @@ impl Worker {
         )
         .map_err(|e| e.to_string())?;
         let model_type = source.get("model_type").and_then(serde_json::Value::as_str);
+        if (options.batch.is_some() || options.multimodal)
+            && (!matches!(model_type, Some("qwen3_5" | "qwen3_5_text"))
+                || options.devices.len() != 1
+                || options.prefill_only
+                || options.prefill_address.is_some())
+        {
+            return Err(
+                "batch/image serving currently requires single-device integrated native Qwen3.5"
+                    .into(),
+            );
+        }
         if options.mla_mode != DeepseekV2AttentionMode::Expanded
             && model_type != Some("deepseek_v2")
         {
@@ -279,6 +294,43 @@ impl Worker {
         use ruda_tensor_device::cuda::{Cuda, CudaDevice};
         type B = Cuda<half::bf16, i32>;
         let device = CudaDevice::new(self.options.devices[0]);
+        if self.options.multimodal {
+            type Native = rullm::backends::Nvidia<half::bf16, i32, u8>;
+            let model = rullm::load_huggingface_qwen35_multimodal::<Native>(
+                &self.options.directory,
+                &device,
+            )
+            .map_err(|e| e.to_string())?;
+            let processor = rullm::Qwen35ImageProcessor::from_huggingface(&self.options.directory)
+                .map_err(|e| e.to_string())?;
+            return serving::run_qwen35_multimodal(
+                model,
+                processor,
+                device,
+                self.tokenizer.expect("image tokenizer"),
+                self.tokenizer_config,
+                self.options.model_id,
+                self.options.cache,
+                self.jobs,
+                || ready.take().expect("worker readiness").send(Ok(())).is_ok(),
+            );
+        }
+        if let Some(config) = self.options.batch {
+            type Native = rullm::backends::Nvidia<half::bf16, i32, u8>;
+            let loaded = load_huggingface_qwen35_text::<Native>(&self.options.directory, &device)
+                .map_err(|e| e.to_string())?;
+            let eos = vec![loaded.model.config.eos_token_id];
+            return serving::run_continuous_batch::<Native, _>(
+                loaded.model,
+                device,
+                eos,
+                self.tokenizer.expect("batch tokenizer"),
+                self.tokenizer_config,
+                config,
+                self.jobs,
+                || ready.take().expect("worker readiness").send(Ok(())).is_ok(),
+            );
+        }
         if self.options.devices.len() == 1 {
             return self.run_single::<B>(device, ready);
         }

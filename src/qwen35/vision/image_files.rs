@@ -6,9 +6,13 @@ fn decode_rgb(path: &Path) -> Result<image::RgbImage, String> {
     if image::ImageFormat::from_path(path).ok() != Some(image::ImageFormat::Jpeg) {
         return image::open(path).map(|image| image.into_rgb8()).map_err(|error| error.to_string());
     }
-    use libjpeg_turbo_rs::{Decoder, DctMethod, PixelFormat};
     let bytes = std::fs::read(path).map_err(|error| error.to_string())?;
-    let mut decoder = Decoder::new(&bytes).map_err(|error| error.to_string())?;
+    decode_jpeg(&bytes)
+}
+
+fn decode_jpeg(bytes: &[u8]) -> Result<image::RgbImage, String> {
+    use libjpeg_turbo_rs::{Decoder, DctMethod, PixelFormat};
+    let mut decoder = Decoder::new(bytes).map_err(|error| error.to_string())?;
     let header = decoder.header();
     let (width, height) = (header.width as u32, header.height as u32);
     let (format, color) = if header.components.len() == 1 {
@@ -30,6 +34,21 @@ fn decode_rgb(path: &Path) -> Result<image::RgbImage, String> {
 }
 
 impl Qwen35ImageProcessor {
+    /// Decode encoded JPEG/PNG request bodies using the same file-input pixel path.
+    pub fn preprocess_encoded(&self, bodies: &[Vec<u8>]) -> Result<Qwen35PreparedImages, GenerationError> {
+        let images = bodies.iter().map(|bytes| {
+            match image::guess_format(bytes).map_err(|e|e.to_string())? {
+                image::ImageFormat::Jpeg=>decode_jpeg(bytes),
+                image::ImageFormat::Png=>image::load_from_memory_with_format(bytes,image::ImageFormat::Png)
+                    .map(|image|image.into_rgb8()).map_err(|e|e.to_string()),
+                _=>Err("image requests require JPEG or PNG data".into()),
+            }
+        }).collect::<Result<Vec<_>,String>>().map_err(GenerationError)?;
+        let views = images.iter().map(|image|Qwen35RgbImage {pixels:image.as_raw(),
+            height:image.height() as usize,width:image.width() as usize}).collect::<Vec<_>>();
+        self.preprocess_rgb(&views)
+    }
+
     /// Decode JPEG/PNG files to RGB8 and run the same native resize/normalize/packing path.
     pub fn preprocess_files<P: AsRef<Path>>(
         &self, paths: &[P],

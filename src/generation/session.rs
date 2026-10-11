@@ -154,12 +154,25 @@ impl<'a,B: Backend,M: CausalModel<B>> CausalGenerationSession<'a,B,M> {
     /// cancellation is observed between steps and never interrupts a running kernel.
     pub fn step(&mut self) -> Result<Option<GenerationStep>,GenerationError> {
         if let Some(error) = &self.fault {return Err(error.clone());}
-        let result = self.step_inner();
+        let result = self.step_inner(None);
         if let Err(error) = &result {self.fault = Some(error.clone());}
         result
     }
 
-    fn step_inner(&mut self) -> Result<Option<GenerationStep>,GenerationError> {
+    /// Apply a request-local constraint before the existing greedy or sampled selection.
+    /// The caller owns processor state and must restore it separately from a session record.
+    pub fn step_with_logits_processor(&mut self,
+        mut processor: impl FnMut(Tensor<B,3>) -> Result<Tensor<B,3>, GenerationError>)
+        -> Result<Option<GenerationStep>, GenerationError> {
+        if let Some(error) = &self.fault {return Err(error.clone());}
+        let result = self.step_inner(Some(&mut processor));
+        if let Err(error) = &result {self.fault = Some(error.clone());}
+        result
+    }
+
+    fn step_inner(&mut self,
+        processor: Option<&mut dyn FnMut(Tensor<B,3>) -> Result<Tensor<B,3>,GenerationError>>)
+        -> Result<Option<GenerationStep>,GenerationError> {
         if self.finish_reason.is_some() {return Ok(None);}
         if self.control.is_cancelled() {self.finish(GenerationFinishReason::Cancelled);return Ok(None);}
         if let Some(token) = self.pending_input {
@@ -172,6 +185,8 @@ impl<'a,B: Backend,M: CausalModel<B>> CausalGenerationSession<'a,B,M> {
                 .ok_or_else(||GenerationError("generation cache input count overflow".into()))?;
         }
         let logits = self.logits.as_ref().ok_or_else(||GenerationError("generation has no pending logits or decode input".into()))?.clone();
+        let logits = if let Some(processor) = processor { processor(logits)? } else { logits };
+        self.check_logits(&logits)?;
         let token = if let Some(sampler) = &mut self.sampler {sampler.sample(&read_last_logits(logits)?)?}
             else {self.model.greedy_token(logits)?};
         if token < 0 || token as usize >= self.limits.vocab_size {
