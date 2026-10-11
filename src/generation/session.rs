@@ -60,6 +60,28 @@ impl<'a,B: Backend,M: CausalModel<B>> CausalGenerationSession<'a,B,M> {
 
     fn new(model: &'a M,limits: CausalModelLimits,prompt: &[i32],generation: GreedyGenerationConfig,
         sampler: Option<TokenSampler>,control: &'a GenerationControl,device: &B::Device) -> Result<Self,GenerationError> {
+        Self::new_with_prefix(model,limits,prompt,generation,sampler,control,device,None)
+    }
+
+    pub fn new_greedy_prefilled(model: &'a M,limits: CausalModelLimits,prompt: &[i32],
+        generation: GreedyGenerationConfig,control: &'a GenerationControl,device: &B::Device,
+        model_id: &str,prefix: crate::prefix_cache::PrefilledPrompt<B,M>) -> Result<Self,GenerationError> {
+        prefix.validate(model_id,limits,prompt,device)?;
+        Self::new_with_prefix(model,limits,prompt,generation,None,control,device,Some(prefix))
+    }
+
+    pub fn new_sampled_prefilled(model: &'a M,limits: CausalModelLimits,prompt: &[i32],
+        generation: SamplingGenerationConfig,control: &'a GenerationControl,device: &B::Device,
+        model_id: &str,prefix: crate::prefix_cache::PrefilledPrompt<B,M>) -> Result<Self,GenerationError> {
+        prefix.validate(model_id,limits,prompt,device)?;
+        let sampler = TokenSampler::new(generation.sampling)?;
+        let generation = GreedyGenerationConfig {max_new_tokens:generation.max_new_tokens,eos_token_ids:generation.eos_token_ids};
+        Self::new_with_prefix(model,limits,prompt,generation,Some(sampler),control,device,Some(prefix))
+    }
+
+    fn new_with_prefix(model: &'a M,limits: CausalModelLimits,prompt: &[i32],generation: GreedyGenerationConfig,
+        sampler: Option<TokenSampler>,control: &'a GenerationControl,device: &B::Device,
+        prefix: Option<crate::prefix_cache::PrefilledPrompt<B,M>>) -> Result<Self,GenerationError> {
         let eos = validate_generation(&limits,prompt,&generation)?;
         control.validate(limits.vocab_size)?;
         let finish_reason = if control.is_cancelled() {Some(GenerationFinishReason::Cancelled)}
@@ -70,13 +92,36 @@ impl<'a,B: Backend,M: CausalModel<B>> CausalGenerationSession<'a,B,M> {
             output:TokenGenerationOutput {token_ids:prompt.to_vec(),generated_token_ids:Vec::new(),stopped_on_eos:false},
             finish_reason,fault:None};
         if session.finish_reason.is_none() {
-            let input = Tensor::<B,2,Int>::from_data(TensorData::new(prompt.to_vec(),[1,prompt.len()]),device);
-            let logits = session.model.try_forward_cached_last(input,&mut session.cache)?;
+            let start = if let Some(prefix) = prefix {
+                let start = prefix.tokens.len();
+                session.cache = prefix.cache;
+                session.logits = Some(prefix.logits);
+                start
+            } else {0};
+            let logits = if start == prompt.len() {
+                session.logits.take().ok_or_else(||GenerationError("prefilled prompt has no next-token logits".into()))?
+            } else {
+                let suffix = prompt[start..].to_vec();
+                let input = Tensor::<B,2,Int>::from_data(TensorData::new(suffix,[1,prompt.len()-start]),device);
+                session.model.try_forward_cached_last(input,&mut session.cache)?
+            };
             session.check_logits(&logits)?;
             session.logits = Some(logits);
             session.processed_tokens = prompt.len();
         }
         Ok(session)
+    }
+
+    pub fn prefilled_prompt(&self,model_id: &str) -> Result<crate::prefix_cache::PrefilledPrompt<B,M>,GenerationError>
+        where M::Cache: Clone + super::GenerationCacheContinuation<B> {
+        if model_id.is_empty() || self.fault.is_some() || self.processed_tokens != self.prompt_length
+            || !self.output.generated_token_ids.is_empty() || self.cache.generation_position() != self.prompt_length {
+            return Err(GenerationError("prefix capture requires a complete prefill before token selection".into()));
+        }
+        let logits = self.logits.as_ref().ok_or_else(||GenerationError("prefix capture requires pending logits".into()))?;
+        B::sync(&self.device).map_err(|e|GenerationError(e.to_string()))?;
+        Ok(crate::prefix_cache::PrefilledPrompt {model_id:model_id.into(),limits:self.limits,
+            tokens:self.output.token_ids.clone(),cache:self.cache.clone(),logits:logits.clone()})
     }
 
     fn check_logits(&self,logits: &Tensor<B,3>) -> Result<(),GenerationError> {

@@ -80,4 +80,37 @@ impl Checkpoint {
         self.consumed.insert(name.into());
         Ok(Tensor::from_data(data, (device, snapshot.dtype)))
     }
+
+    pub fn tensor_slice<B: Backend, const D: usize>(
+        &mut self,
+        name: &str,
+        shape: [usize; D],
+        axis: usize,
+        range: std::ops::Range<usize>,
+        device: &B::Device,
+    ) -> Result<Tensor<B, D>, HuggingFaceLoadError> {
+        let snapshot = self.tensors.get(name)
+            .ok_or_else(|| HuggingFaceLoadError(format!("missing tensor {name}")))?;
+        if snapshot.shape != shape.into()
+            || !matches!(snapshot.dtype, DType::F32 | DType::F16 | DType::BF16)
+            || axis >= D || range.start >= range.end || range.end > shape[axis]
+        {
+            return Err(HuggingFaceLoadError(format!("invalid native shard for {name}")));
+        }
+        let data = snapshot.to_data()
+            .map_err(|e| HuggingFaceLoadError(format!("{name}: {e}")))?;
+        let inner = shape[axis + 1..].iter().product::<usize>() * snapshot.dtype.size();
+        let outer = shape[..axis].iter().product::<usize>();
+        let stride = shape[axis] * inner;
+        let mut bytes = Vec::with_capacity(outer * range.len() * inner);
+        for row in 0..outer {
+            bytes.extend_from_slice(&data.as_bytes()[row * stride + range.start * inner
+                ..row * stride + range.end * inner]);
+        }
+        let mut local = shape;
+        local[axis] = range.len();
+        self.consumed.insert(name.into());
+        Ok(Tensor::from_data(ruda_tensor::api::TensorData::from_bytes_vec(bytes, local, snapshot.dtype),
+            (device, snapshot.dtype)))
+    }
 }

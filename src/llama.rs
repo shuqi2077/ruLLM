@@ -149,7 +149,7 @@ impl<B: Backend> LlamaLayerCache<B> {
     /// Append into a geometrically growing physical buffer. The logical prefix
     /// remains contiguous, while capacity growth only copies history at chunk
     /// boundaries instead of once for every decoded token.
-    fn append_growable(
+    pub(crate) fn append_growable(
         &mut self,
         key: Tensor<B, 4>,
         value: Tensor<B, 4>,
@@ -266,9 +266,9 @@ impl<B: Backend> LlamaLayerCache<B> {
 /// Per-layer KV cache and the absolute RoPE position for autoregressive decoding.
 #[derive(Clone, Debug)]
 pub struct LlamaKvCache<B: Backend> {
-    layers: Vec<LlamaLayerCache<B>>,
-    position: usize,
-    max_sequence_length: usize,
+    pub(crate) layers: Vec<LlamaLayerCache<B>>,
+    pub(crate) position: usize,
+    pub(crate) max_sequence_length: usize,
 }
 
 impl<B: Backend> LlamaKvCache<B> {
@@ -293,6 +293,15 @@ impl<B: Backend> LlamaKvCache<B> {
 
     pub const fn capacity(&self) -> usize {
         self.max_sequence_length
+    }
+
+    pub(crate) fn truncate(&mut self, position: usize) -> Result<(), crate::GenerationError> {
+        if position > self.position || self.layers.iter().any(|layer| layer.sequence_length != self.position) {
+            return Err(crate::GenerationError("invalid native KV rollback boundary".into()));
+        }
+        for layer in &mut self.layers {layer.sequence_length = position;}
+        self.position = position;
+        Ok(())
     }
 }
 

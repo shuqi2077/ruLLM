@@ -7,6 +7,22 @@ mod llama;
 mod continuous_batch;
 mod paged_kv;
 mod qwen35;
+mod qwen3;
+mod deepseek2;
+pub use deepseek2::{DeepseekV2Config, DeepseekV2Yarn, DeepseekV2Model, DeepseekV2Cache,
+    DeepseekV2CacheRecord, DeepseekV2AttentionMode, LoadedDeepseekV2, load_huggingface_deepseek_v2};
+#[cfg(feature = "tensor-parallel")]
+pub use deepseek2::parallel::{DeepseekV2ExpertParallel, DeepseekV2ExpertParallelCache,
+    DeepseekV2ExpertParallelCacheRecord, LoadedDeepseekV2ExpertParallel, load_huggingface_deepseek_v2_expert_parallel};
+pub use qwen3::{Qwen3Config,Qwen3Model,LoadedQwen3,load_huggingface_qwen3};
+pub use qwen3::{Qwen3Drafted, Qwen3DraftCache, Qwen3DraftCacheRecord, load_huggingface_qwen3_draft};
+#[cfg(feature = "tensor-parallel")]
+pub use qwen3::parallel::{Qwen3TensorParallel, Qwen3TensorParallelCache, Qwen3TensorParallelCacheRecord,
+    LoadedQwen3TensorParallel, load_huggingface_qwen3_tensor_parallel};
+pub mod prefix_cache;
+pub mod disaggregated;
+#[cfg(feature = "serving")]
+pub mod serving;
 
 pub use qwen35::{Qwen35TextConfig, Qwen35TextModel, Qwen35Cache, Qwen35LayerType, Qwen35RopeConfig, LoadedQwen35Text, load_huggingface_qwen35_text, load_huggingface_qwen35_text_packed};
 pub use qwen35::{LoadedQwen35Vision, Qwen35VisionConfig, Qwen35VisionModel, Qwen35VisionOutput, load_huggingface_qwen35_vision};

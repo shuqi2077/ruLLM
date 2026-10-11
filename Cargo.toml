@@ -16,31 +16,46 @@ cann = ["dep:ruda-driver-cann", "rublas/cann", "rudnn/cann"]
 amd = ["dep:ruda-driver-hip", "ruda-tensor/hip", "ruda-tensor-device/autotune"]
 nvidia = ["ruda-tensor-device/cuda", "ruda-tensor-device/autotune", "dep:ruda-driver-cuda"]
 nvidia-ptx = ["nvidia", "ruda-driver-cuda/direct-ptx"]
+serving = ["dep:axum", "dep:tokio", "dep:async-stream", "dep:minijinja", "dep:minijinja-contrib"]
+tensor-parallel = ["ruda-tensor/distributed", "ruda-tensor-device/distributed"]
+expert-parallel = ["tensor-parallel"]
 
 [dependencies]
-ruda-driver-cann = { version = "0.1.56", path = "../ruda-driver-cann", optional = true }
-ruda-model = { version = "0.21.55", path = "../ruda-model", default-features = false, features = ["std"] }
-ruda-nn = { version = "0.21.64", path = "../ruda-nn", default-features = false, features = ["std"] }
-ruda-tensor = { version = "0.21.57", path = "../ruda-tensor", default-features = false, features = ["std", "kernel"] }
-ruda-tensor-device = { version = "0.21.57", path = "../ruda-tensor-device", default-features = false, features = ["std", "fusion"] }
-ruda-store = { version = "0.21.54", path = "../ruda-store", default-features = false, features = ["std", "safetensors", "memmap"] }
-ruda-kernel = { version = "0.1.33", path = "../ruda-kernel", default-features = false, features = ["frontend-std", "library"] }
+ruda-driver-cann = { version = "0.1.85", path = "../ruda-driver-cann", optional = true }
+ruda-model = { version = "0.21.58", path = "../ruda-model", default-features = false, features = ["std"] }
+ruda-nn = { version = "0.21.67", path = "../ruda-nn", default-features = false, features = ["std"] }
+ruda-tensor = { version = "0.21.59", path = "../ruda-tensor", default-features = false, features = ["std", "kernel"] }
+ruda-tensor-device = { version = "0.21.59", path = "../ruda-tensor-device", default-features = false, features = ["std", "fusion"] }
+ruda-store = { version = "0.21.57", path = "../ruda-store", default-features = false, features = ["std", "safetensors", "memmap"] }
+ruda-kernel = { version = "0.1.35", path = "../ruda-kernel", default-features = false, features = ["frontend-std", "library"] }
 ruda-core = { version = "0.1.6", path = "../ruda-core", default-features = false, features = ["std", "ir", "tensor"] }
-ruda = { version = "0.1.34", path = "../ruda", default-features = false, features = ["runtime", "runtime-std", "runtime-storage-bytes"] }
-ruda-driver-hip = { version = "0.1.82", path = "../ruda-driver-hip", default-features = false, features = ["std"], optional = true }
-ruda-driver-cuda = { version = "0.1.82", path = "../ruda-driver-cuda", default-features = false, features = ["std"], optional = true }
-rublas = { version = "0.1.82", path = "../ruBLAS", default-features = false, features = ["tensor-int4", "tensor-matmul", "std"] }
-rudnn = { version = "0.1.82", package = "ruDNN", path = "../ruDNN", default-features = false, features = ["tensor-gated-delta", "tensor-normalization", "tensor-paged-attention", "tensor-moe", "std"] }
+ruda = { version = "0.1.36", path = "../ruda", default-features = false, features = ["runtime", "runtime-std", "runtime-storage-bytes"] }
+ruda-driver-hip = { version = "0.1.85", path = "../ruda-driver-hip", default-features = false, features = ["std"], optional = true }
+ruda-driver-cuda = { version = "0.1.85", path = "../ruda-driver-cuda", default-features = false, features = ["std"], optional = true }
+rublas = { version = "0.1.85", path = "../ruBLAS", default-features = false, features = ["tensor-int4", "tensor-matmul", "std"] }
+rudnn = { version = "0.1.85", package = "ruDNN", path = "../ruDNN", default-features = false, features = ["tensor-gated-delta", "tensor-normalization", "tensor-paged-attention", "tensor-moe", "std"] }
 half = "=2.7.1"
 chacha20 = { version = "=0.10.2", default-features = false, features = ["rng"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+rmp-serde = "1.3"
+sha2 = "0.10"
+axum = { version = "0.8", optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros"], optional = true }
+async-stream = { version = "0.3", optional = true }
+minijinja = { version = "2", features = ["json", "builtins"], optional = true }
+minijinja-contrib = { version = "2", features = ["pycompat"], optional = true }
 image = { version = "=0.25.10", default-features = false, features = ["jpeg", "png"] }
 libjpeg-turbo-rs = "=0.8.0"
 tokenizers = { version = "0.22.2", default-features = false, features = ["onig"] }
 
 [lints]
 workspace = true
+
+[[bin]]
+name = "ruda-serve"
+path = "src/bin/ruda-serve.rs"
+required-features = ["serving", "nvidia"]
 
 [[example]]
 name = "qwen2_generate"
