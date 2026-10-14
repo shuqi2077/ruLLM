@@ -257,7 +257,7 @@ impl Selection {
     }
 }
 
-fn draw(probabilities: &[f64], uniform: f64) -> Result<i32, GenerationError> {
+pub(super) fn draw(probabilities: &[f64], uniform: f64) -> Result<i32, GenerationError> {
     let sum: f64 = probabilities.iter().sum();
     if !sum.is_finite() || sum <= 0.0 {
         return Err(GenerationError("empty or nonfinite speculative sampling distribution".into()));

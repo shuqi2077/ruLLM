@@ -108,6 +108,28 @@ impl TokenSampler {
         self.workspace = SamplingWorkspace::default();
     }
 
+    pub fn propose(&mut self, logits: &[f32]) -> Result<(i32, Vec<f64>), GenerationError> {
+        let probabilities = self.workspace.fill(logits, self.config)?.to_vec();
+        let token = super::speculative::draw(&probabilities, self.rng.random())?;
+        Ok((token, probabilities))
+    }
+
+    /// Rejection-corrected selection from the processed target distribution.
+    /// q is the exact distribution used to draw candidate, not new draft logits.
+    pub fn verify_draft(&mut self, candidate: i32, q: &[f64], logits: &[f32])
+        -> Result<(i32, bool), GenerationError> {
+        if candidate < 0 || candidate as usize >= q.len() || q.len() != logits.len()
+            || q.iter().any(|x| !x.is_finite() || *x < 0.0) || q[candidate as usize] <= 0.0 {
+            return Err(GenerationError("invalid draft candidate distribution".into()));
+        }
+        let p = self.workspace.fill(logits, self.config)?;
+        if self.rng.random::<f64>() < (p[candidate as usize] / q[candidate as usize]).min(1.0) {
+            return Ok((candidate, true));
+        }
+        let residual = p.iter().zip(q).map(|(p, q)| (p - q).max(0.0)).collect::<Vec<_>>();
+        Ok((super::speculative::draw(&residual, self.rng.random())?, false))
+    }
+
     /// Sample one vocabulary index. Negative infinity masks a token; NaN,
     /// positive infinity and a fully masked vocabulary return an error.
     pub fn sample(&mut self, logits: &[f32]) -> Result<i32, GenerationError> {

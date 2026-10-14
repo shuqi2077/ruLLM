@@ -5,6 +5,10 @@ use crate::{
 };
 use ruda_tensor::api::activation::sigmoid;
 use std::collections::{BTreeMap, BTreeSet};
+mod prefix;
+mod speculative;
+pub use speculative::Qwen35BatchDelta;
+use speculative::Trajectory;
 
 #[derive(Clone)]
 struct KvPage<B: Backend> {
@@ -31,6 +35,7 @@ pub struct Qwen35BatchCache<B: Backend> {
     fused_paged: bool,
     requests: BTreeMap<RequestId, Qwen35Cache<B>>,
     tables: BTreeMap<RequestId, Vec<KvPageId>>,
+    trajectories: BTreeMap<RequestId,Trajectory<B>>,
 }
 
 impl<B: Backend> Qwen35BatchCache<B> {
@@ -79,6 +84,7 @@ where
             pages: (0..self.layers.len()).map(|_| BTreeMap::new()).collect(),
             requests: BTreeMap::new(),
             tables: BTreeMap::new(),
+            trajectories: BTreeMap::new(),
         }
     }
     fn fork_batch_cache(&self, cache: &Self::Cache) -> Self::Cache {
@@ -89,6 +95,7 @@ where
             .requests
             .retain(|id, _| scheduler.kv_cache().contains_sequence(*id));
         cache.tables.retain(|id, _| cache.requests.contains_key(id));
+        cache.trajectories.retain(|id,_|cache.requests.contains_key(id));
         let live: BTreeSet<_> = cache.tables.values().flatten().copied().collect();
         for pages in &mut cache.pages { pages.retain(|id, _| live.contains(id)); }
         for arena in cache.arenas.iter_mut().flatten() {
@@ -102,6 +109,14 @@ where
         cache: &mut Self::Cache,
         device: &R::Device,
     ) -> Result<Tensor<DeviceBackend<R, F, I, BT>, 3>, GenerationError> {
+        self.forward_batch_impl(batch,cache,device,false)
+    }
+}
+
+impl<R,F,I,BT> Qwen35TextModel<DeviceBackend<R,F,I,BT>>
+where R:DeviceRuntime,R::Server:ComputeServer,R::Device:DeviceOps,F:FloatElement,I:IntElement,BT:BoolElement {
+    fn forward_batch_impl(&self,batch:&ScheduledBatch,cache:&mut Qwen35BatchCache<DeviceBackend<R,F,I,BT>>,device:&R::Device,
+        speculative:bool)->Result<Tensor<DeviceBackend<R,F,I,BT>,3>,GenerationError> {
         let (b, s) = (batch.batch_size(), batch.next_n());
         cache
             .config
@@ -164,6 +179,14 @@ where
                 .entry(row.request_id)
                 .or_insert_with(|| self.new_cache());
             cache.tables.insert(row.request_id, row.block_table.clone());
+            if speculative {
+                let history=cache.trajectories.entry(row.request_id).or_insert_with(||Trajectory {
+                    start:row.start_position,end:row.start_position,initial:cache.requests[&row.request_id].clone(),
+                    layers:(0..self.layers.len()).map(|_|Vec::new()).collect(),
+                    rotary_lengths:Vec::new(),
+                });
+                if history.end!=row.start_position {return Err(GenerationError("Qwen speculative history is not contiguous".into()));}
+            } else {cache.trajectories.remove(&row.request_id);}
         }
         let tokens = Tensor::<DeviceBackend<R, F, I, BT>, 2, Int>::from_data(
             TensorData::new(batch.token_matrix(), [b, s]),
@@ -173,11 +196,14 @@ where
         let dtype = hidden.dtype();
         let mut cos_rows = Vec::with_capacity(b);
         let mut sin_rows = Vec::with_capacity(b);
+        let mut rotary_lengths = Vec::with_capacity(b);
         for row in &batch.sequences {
+            let rotary = self.rotary_for(&cache.requests[&row.request_id])?;
             let (cos, sin) =
-                attention::text_rope(&self.config, row.start_position, s, dtype, device);
+                attention::text_rope(&rotary, row.start_position, s, dtype, device);
             cos_rows.push(cos);
             sin_rows.push(sin);
+            rotary_lengths.push(rotary.cached_length());
         }
         let cos = Tensor::cat(cos_rows, 0);
         let sin = Tensor::cat(sin_rows, 0);
@@ -226,13 +252,25 @@ where
                     let mut convolution =
                         (!convolutions.is_empty()).then(|| Tensor::cat(convolutions, 0));
                     let mut state = (!states.is_empty()).then(|| Tensor::cat(states, 0));
-                    let out =
-                        delta.forward(normalized, &self.config, &mut convolution, &mut state)?;
+                    let (out,history)=if speculative {
+                        let (output,history)=delta.forward_with_history(normalized,&self.config,&mut convolution,&mut state)?;
+                        if history.states.len()!=s {return Err(GenerationError("Qwen delta omitted token state history".into()));}
+                        (output,Some(history))
+                    } else {(delta.forward(normalized,&self.config,&mut convolution,&mut state)?,None)};
                     let convolution = convolution.expect("delta forward returns convolution state");
                     let state = state.expect("delta forward returns recurrent state");
                     let [_, channels, width] = convolution.dims();
                     let [_, heads, kd, vd] = state.dims();
                     for (i, row) in batch.sequences.iter().enumerate() {
+                        if let Some(history)=&history {
+                            let trajectory=&mut cache.trajectories.get_mut(&row.request_id).unwrap().layers[index];
+                            for step in 0..s {
+                                trajectory.push(speculative::RecurrentStep {
+                                    convolution:history.convolution.clone().slice([i..i+1,0..channels,step+1..step+1+width]),
+                                    state:history.states[step].clone().slice([i..i+1,0..heads,0..kd,0..vd]),
+                                });
+                            }
+                        }
                         cache.requests.get_mut(&row.request_id).unwrap().layers[index] =
                             LayerCache::Delta {
                                 convolution: Some(convolution.clone().slice([
@@ -251,19 +289,24 @@ where
                     out
                 }
             };
-            hidden = hidden + update;
-            hidden = hidden.clone() + layer.mlp.forward(layer.post_norm.forward(hidden)?)?;
+            hidden = hidden + self.reduce(update);
+            let update = layer.mlp.forward(layer.post_norm.forward(hidden.clone())?)?;
+            hidden = hidden + self.reduce(update);
         }
-        for row in &batch.sequences {
+        for (row, rotary_length) in batch.sequences.iter().zip(rotary_lengths) {
             let state = cache.requests.get_mut(&row.request_id).unwrap();
             state.position = row.context_length;
             state.batch = Some(1);
+            state.rotary_length = rotary_length;
+            if speculative {
+                let history = cache.trajectories.get_mut(&row.request_id).unwrap();
+                history.end = row.context_length;
+                history.rotary_lengths.extend(std::iter::repeat_n(rotary_length, s));
+            }
         }
         let width = hidden.dims()[2];
-        Ok(self.head.forward(
-            self.norm
-                .forward(hidden.slice([0..b, s - 1..s, 0..width]))?,
-        ))
+        if !speculative {hidden=hidden.slice([0..b,s-1..s,0..width]);}
+        Ok(self.head.forward(self.norm.forward(hidden)?))
     }
 }
 

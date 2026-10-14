@@ -29,6 +29,7 @@ where
     let model_directory = canonical_directory(model_directory.as_ref())?;
     let config_path = model_directory.join(CONFIG_FILE);
     let source: HuggingFaceLlamaConfig = read_json(&config_path)?;
+    let rotary = rope::parameters(&source)?;
     let (config, tied_word_embeddings, config_eos_token_ids) = convert_qwen2_config(source)?;
     let default_eos_token_ids =
         load_generation_eos_token_ids(&model_directory, config.vocab_size, config_eos_token_ids)?;
@@ -36,6 +37,7 @@ where
     let (model, applied_tensors) = AwqLlamaForCausalLm::<R>::load_checkpoint(
         &checkpoint,
         &config,
+        &rotary,
         true,
         tied_word_embeddings,
         device,
@@ -57,6 +59,11 @@ impl<R: DeviceRuntime> LoadedHuggingFaceAwqQwen2<R>
 where
     R::Device: DeviceOps,
 {
+    pub fn set_context_limit(&mut self, length: usize) -> Result<(), GenerationError> {
+        self.model.set_context_limit(length)?;
+        self.config.max_sequence_length = length;
+        Ok(())
+    }
     pub fn generate_tokens(
         &self,
         prompt_token_ids: &[i32],

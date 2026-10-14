@@ -10,6 +10,7 @@ where
     pub(super) v_proj: AwqProjection<R>,
     pub(super) o_proj: AwqProjection<R>,
     pub(super) rope: RotaryEncoding<AwqBackend<R>>,
+    pub(super) rotary_state: Option<crate::llama::rope::RotaryState>,
     pub(super) rotary_layout: RotaryLayout,
     pub(super) num_query_heads: usize,
     pub(super) num_kv_heads: usize,
@@ -24,6 +25,7 @@ where
         &self,
         input: Tensor<AwqBackend<R>, 3>,
         position: usize,
+        cache: Option<&mut LlamaLayerCache<AwqBackend<R>>>,
     ) -> (
         Tensor<AwqBackend<R>, 4>,
         Tensor<AwqBackend<R>, 4>,
@@ -45,11 +47,11 @@ where
             .forward(input)
             .reshape([batch, sequence, self.num_kv_heads, self.head_dimension])
             .swap_dims(1, 2);
-        (
-            self.apply_rope(query, position),
-            self.apply_rope(key, position),
-            value,
-        )
+        let (query,key) = match cache {
+            Some(cache) => cache.rotate_pair(query,key,self.rotary_state.as_ref(),position,|t|self.apply_rope(t,position)),
+            None => (self.apply_rope(query,position),self.apply_rope(key,position)),
+        };
+        (query,key,value)
     }
 
     pub(super) fn apply_rope(
@@ -57,6 +59,10 @@ where
         input: Tensor<AwqBackend<R>, 4>,
         start: usize,
     ) -> Tensor<AwqBackend<R>, 4> {
+        if let Some(state) = &self.rotary_state {
+            let end = start + input.dims()[2];
+            return state.fresh().apply(input, start, end);
+        }
         match self.rotary_layout {
             RotaryLayout::Interleaved => self.rope.apply(input, start),
             RotaryLayout::HalfSplit => apply_half_split_rope(&self.rope, input, start),
@@ -81,7 +87,7 @@ where
     }
 
     pub(super) fn forward(&self, input: Tensor<AwqBackend<R>, 3>) -> Tensor<AwqBackend<R>, 3> {
-        let (query, key, value) = self.project(input, 0);
+        let (query, key, value) = self.project(input, 0, None);
         let key = repeat_kv(key, self.num_query_heads / self.num_kv_heads);
         let value = repeat_kv(value, self.num_query_heads / self.num_kv_heads);
         self.finish(causal_attention(query, key, value, 0))
@@ -98,7 +104,7 @@ where
             position,
             "all Llama layer caches must advance in lockstep"
         );
-        let (query, key, value) = self.project(input, position);
+        let (query, key, value) = self.project(input, position, Some(cache));
         let (key, value) = cache.append(key, value);
         let key = repeat_kv(key, self.num_query_heads / self.num_kv_heads);
         let value = repeat_kv(value, self.num_query_heads / self.num_kv_heads);

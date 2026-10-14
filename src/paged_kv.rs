@@ -289,6 +289,44 @@ impl PagedKvCacheManager {
         Ok(context_length)
     }
 
+    /// Extend an in-flight append for speculative device work. The caller must
+    /// synchronize that work before committing a prefix or releasing pages.
+    pub fn extend_append(&mut self,id:KvReservationId,extra:usize)->Result<PagedKvAppendReservation,PagedKvError> {
+        self.validate_reservation(id)?;
+        let reservation=&self.reservations[&id];
+        let request_id=reservation.request_id;let start=reservation.start_position;
+        let count=reservation.token_count.checked_add(extra).ok_or_else(||PagedKvError("lookahead token count overflow".into()))?;
+        let end=start.checked_add(count).ok_or_else(||PagedKvError("lookahead context overflow".into()))?;
+        if end>self.config.max_sequence_length {return Err(PagedKvError("lookahead exceeds sequence capacity".into()));}
+        let current=self.sequences[&request_id].pages.len();
+        let additional=end.div_ceil(self.config.block_size).saturating_sub(current);
+        if additional>self.free_pages.len() {return Err(PagedKvError("insufficient lookahead pages".into()));}
+        let mut newly_allocated_pages=Vec::with_capacity(additional);
+        for _ in 0..additional {newly_allocated_pages.push(self.free_pages.pop_first().expect("lookahead page count checked"));}
+        let sequence=self.sequences.get_mut(&request_id).unwrap();sequence.pages.extend(&newly_allocated_pages);
+        self.reservations.get_mut(&id).unwrap().token_count=count;
+        Ok(PagedKvAppendReservation{id,request_id,start_position:start,token_count:count,context_length:end,
+            newly_allocated_pages,block_table:sequence.pages.clone()})
+    }
+
+    /// Commit only the consumed inputs, atomically validating every row first.
+    /// Unconsumed lookahead pages return to the same bounded physical pool.
+    pub fn commit_append_prefixes(&mut self,rows:&[(KvReservationId,usize)])->Result<Vec<usize>,PagedKvError> {
+        self.validate_reservations(&rows.iter().map(|(id,_)|*id).collect::<Vec<_>>())?;
+        for &(id,count) in rows {
+            if count==0 || count>self.reservations[&id].token_count {return Err(PagedKvError("invalid consumed lookahead prefix".into()));}
+        }
+        let mut positions=Vec::with_capacity(rows.len());
+        for &(id,count) in rows {
+            let reservation=self.reservations.remove(&id).unwrap();
+            let sequence=self.sequences.get_mut(&reservation.request_id).unwrap();
+            let position=reservation.start_position+count;
+            let released=sequence.pages.split_off(position.div_ceil(self.config.block_size));
+            self.free_pages.extend(released);sequence.committed_tokens=position;sequence.pending=None;positions.push(position);
+        }
+        Ok(positions)
+    }
+
     pub fn cancel_append(&mut self, reservation_id: KvReservationId) -> Result<(), PagedKvError> {
         self.validate_reservation(reservation_id)?;
         let reservation = self.take_reservation(reservation_id)?;

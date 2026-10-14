@@ -14,6 +14,7 @@ pub struct LoadedQwen35Text<B: Backend> {
     pub dequantized_awq_linears: usize,
     /// Projections retaining packed weights and using the ruBLAS AWQ kernel.
     pub packed_awq_linears: usize,
+    pub packed_fp8_linears: usize,
 }
 
 pub(super) type PackedLoader<B: Backend> = fn(&mut Checkpoint, &str, usize, usize,
@@ -28,6 +29,7 @@ pub(super) struct Weights<'a, B: Backend> {
     pub dequantized_awq_linears: usize,
     pub packed_awq_linears: usize,
     pub packed_loader: Option<PackedLoader<B>>,
+    pub fp8: Option<super::fp8_loading::Weights<B>>,
 }
 impl<B: Backend> Weights<'_, B> {
     pub fn tensor<const D: usize>(
@@ -76,6 +78,12 @@ impl<B: Backend> Weights<'_, B> {
     pub fn projection(&mut self, prefix: &str, input: usize, output: usize, bias: bool)
         -> Result<Projection<B>, HuggingFaceLoadError>
     {
+        if let Some(fp8) = &mut self.fp8 {
+            if fp8.is_encoded(&format!("{prefix}.weight")) {
+                return fp8.projection(self.checkpoint, prefix, input, output, 0..input, 0..output,
+                    bias, true, self.quantized_dtype, self.device);
+            }
+        }
         if self.checkpoint.tensors.contains_key(&format!("{prefix}.qweight")) {
             if let Some(load) = self.packed_loader {
                 let config = self.quantization.as_ref().ok_or_else(|| HuggingFaceLoadError(
@@ -106,11 +114,26 @@ impl<B: Backend> Weights<'_, B> {
     }
 }
 
+impl<B: Backend> super::moe::Weights<B> for Weights<'_, B> {
+    fn checkpoint(&mut self) -> &mut Checkpoint { self.checkpoint }
+    fn device(&self) -> B::Device { self.device.clone() }
+    fn fp8_block(&self) -> Option<[usize; 2]> { self.fp8.as_ref().map(|weights| weights.config.block) }
+    fn fp8_projection(&mut self, weight: TensorData, scales: TensorData) -> Result<Projection<B>, HuggingFaceLoadError> {
+        self.fp8.as_mut().ok_or_else(|| HuggingFaceLoadError("missing FP8 expert backend".into()))?
+            .from_data(weight, scales, None, self.quantized_dtype, self.device)
+    }
+    fn mlp_projection(&mut self, prefix: &str, input: usize, output: usize,
+        part: Option<(usize, std::ops::Range<usize>)>) -> Result<Projection<B>, HuggingFaceLoadError> {
+        if part.is_some() { return Err(HuggingFaceLoadError("single-device MLP loader received a TP shard".into())); }
+        self.projection(prefix, input, output, false)
+    }
+}
+
 pub fn load_huggingface_qwen35_text<B: Backend>(
     directory: impl AsRef<Path>,
     device: &B::Device,
 ) -> Result<LoadedQwen35Text<B>, HuggingFaceLoadError> {
-    load_text(directory.as_ref(), device, None)
+    load_text(directory.as_ref(), device, None, None)
 }
 
 /// Load a text model with device-resident AWQ I32 words. Dense/excluded layers
@@ -121,35 +144,18 @@ pub fn load_huggingface_qwen35_text_packed<R, F, I, BT>(
 where R: DeviceRuntime, R::Server: ComputeServer, R::Device: DeviceOps,
     F: FloatElement, I: IntElement, BT: BoolElement,
 {
-    load_text(directory.as_ref(), device, Some(super::quantized_loading::load_awq_projection::<R,F,I,BT>))
+    load_text(directory.as_ref(), device, Some(super::quantized_loading::load_awq_projection::<R,F,I,BT>),
+        Some(super::fp8_loading::native::<R,F,I,BT>))
 }
 
-fn load_text<B: Backend>(directory: &Path, device: &B::Device, packed_loader: Option<PackedLoader<B>>)
+fn load_text<B: Backend>(directory: &Path, device: &B::Device, packed_loader: Option<PackedLoader<B>>,
+    fp8_loader: Option<super::fp8_loading::Loader<B>>)
     -> Result<LoadedQwen35Text<B>, HuggingFaceLoadError>
 {
     let dir = directory;
     let config_path = dir.join("config.json");
-    let raw: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(&config_path).map_err(|e| HuggingFaceLoadError(e.to_string()))?,
-    )
-    .map_err(|e| HuggingFaceLoadError(e.to_string()))?;
-    // Accept metadata at the HF top level or in text_config, but never prefer
-    // one conflicting declaration silently. Unsupported formats remain errors.
-    let quantization = super::quantized_loading::configuration(&raw)?;
-    let multimodal = raw.get("text_config").is_some();
-    if multimodal && raw["model_type"] != "qwen3_5" {
-        return Err(HuggingFaceLoadError(
-            "expected Qwen3.5 configuration".into(),
-        ));
-    }
-    let config: Qwen35TextConfig = serde_json::from_value(if multimodal {
-        raw["text_config"].clone()
-    } else {
-        raw
-    })
-    .map_err(|e| HuggingFaceLoadError(e.to_string()))?;
-    config.validate()?;
-    let mut checkpoint = Checkpoint::open(dir)?;
+    let (config, quantization, multimodal) = text_configuration(dir)?;
+    let (mut checkpoint, fp8) = super::fp8_loading::open(dir, fp8_loader)?;
     let base = if multimodal { "model.language_model" } else { "model" };
     let quantized_dtype = checkpoint.tensors.get(&format!("{base}.embed_tokens.weight"))
         .map(|tensor| tensor.dtype)
@@ -162,7 +168,48 @@ fn load_text<B: Backend>(directory: &Path, device: &B::Device, packed_loader: Op
         dequantized_awq_linears: 0,
         packed_awq_linears: 0,
         packed_loader,
+        fp8,
     };
+    load_model(config_path, config, multimodal, base, &mut w)
+}
+
+pub(super) fn text_configuration(dir: &Path)
+    -> Result<(Qwen35TextConfig, Option<AwqQuantizationConfig>, bool), HuggingFaceLoadError> {
+    let raw: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(dir.join("config.json")).map_err(|e| HuggingFaceLoadError(e.to_string()))?,
+    )
+    .map_err(|e| HuggingFaceLoadError(e.to_string()))?;
+    // Accept metadata at the HF top level or in text_config, but never prefer
+    // one conflicting declaration silently. Unsupported formats remain errors.
+    let quantization = super::quantized_loading::configuration(&raw)?;
+    let multimodal = raw.get("text_config").is_some();
+    if multimodal && !matches!(raw["model_type"].as_str(), Some("qwen3_5" | "qwen3_5_moe")) {
+        return Err(HuggingFaceLoadError(
+            "expected Qwen3.5 configuration".into(),
+        ));
+    }
+    let mut text = if multimodal {
+        raw["text_config"].clone()
+    } else {
+        raw.clone()
+    };
+    if multimodal {
+        let expected = if raw["model_type"] == "qwen3_5_moe" { "qwen3_5_moe_text" } else { "qwen3_5_text" };
+        if text["model_type"] != expected { return Err(HuggingFaceLoadError("Qwen3.5 top-level and text model types differ".into())); }
+        if text.get("tie_word_embeddings").is_none() {
+            if let Some(tied) = raw.get("tie_word_embeddings") { text["tie_word_embeddings"] = tied.clone(); }
+        }
+    }
+    let mut config: Qwen35TextConfig = serde_json::from_value(text)
+    .map_err(|e| HuggingFaceLoadError(e.to_string()))?;
+    config.quantization_config = None;
+    config.validate()?;
+    Ok((config, quantization, multimodal))
+}
+
+fn load_model<B: Backend>(config_path: std::path::PathBuf, config: Qwen35TextConfig,
+    multimodal: bool, base: &str, w: &mut Weights<'_, B>)
+    -> Result<LoadedQwen35Text<B>, HuggingFaceLoadError> {
     let embedding = Embedding {
         weight: Param::from_tensor(w.tensor(
             &format!("{base}.embed_tokens.weight"),
@@ -237,26 +284,7 @@ fn load_text<B: Backend>(directory: &Path, device: &B::Device, packed_loader: Op
                 c.hidden_size,
                 c.rms_norm_eps,
             )?,
-            mlp: Mlp {
-                gate: w.projection(
-                    &format!("{prefix}.mlp.gate_proj"),
-                    c.hidden_size,
-                    c.intermediate_size,
-                    false,
-                )?,
-                up: w.projection(
-                    &format!("{prefix}.mlp.up_proj"),
-                    c.hidden_size,
-                    c.intermediate_size,
-                    false,
-                )?,
-                down: w.projection(
-                    &format!("{prefix}.mlp.down_proj"),
-                    c.intermediate_size,
-                    c.hidden_size,
-                    false,
-                )?,
-            },
+            mlp: super::moe::load(w, &format!("{prefix}.mlp"), c, None)?,
         });
     }
     let norm = w.norm(&format!("{base}.norm"), c.hidden_size, c.rms_norm_eps)?;
@@ -278,11 +306,10 @@ fn load_text<B: Backend>(directory: &Path, device: &B::Device, packed_loader: Op
     };
     let dequantized_awq_linears = w.dequantized_awq_linears;
     let packed_awq_linears = w.packed_awq_linears;
-    drop(w);
-    let unloaded_tensors = checkpoint
+    let unloaded_tensors = w.checkpoint
         .tensors
         .keys()
-        .filter(|n| !checkpoint.consumed.contains(*n))
+        .filter(|n| !w.checkpoint.consumed.contains(*n))
         .cloned()
         .collect::<Vec<_>>();
     if unloaded_tensors.iter().any(|name| {
@@ -292,23 +319,26 @@ fn load_text<B: Backend>(directory: &Path, device: &B::Device, packed_loader: Op
             "unconsumed Qwen3.5 tensors: {unloaded_tensors:?}"
         )));
     }
-    B::sync(device).map_err(|e| HuggingFaceLoadError(e.to_string()))?;
+    B::sync(w.device).map_err(|e| HuggingFaceLoadError(e.to_string()))?;
     Ok(LoadedQwen35Text {
         report: HuggingFaceLoadReport {
             config_path,
-            weight_files: checkpoint.files,
-            applied_tensors: checkpoint.consumed.len(),
+            weight_files: w.checkpoint.files.clone(),
+            applied_tensors: w.checkpoint.consumed.len(),
             tied_word_embeddings: c.tie_word_embeddings,
         },
         model: Qwen35TextModel {
+            rotary: config.rotary_parameters()?,
             config,
             embedding,
             layers,
             norm,
             head,
+            reduction: None,
         },
         unloaded_tensors,
         dequantized_awq_linears,
         packed_awq_linears,
+        packed_fp8_linears: w.fp8.as_ref().map_or(0, |weights| weights.projections),
     })
 }

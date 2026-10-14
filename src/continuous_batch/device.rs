@@ -17,6 +17,25 @@ pub trait DeviceBatchModel<B: Backend> {
     ) -> Result<Tensor<B, 3>, GenerationError>;
     /// Called only after device completion, when finished/cancelled pages can be released.
     fn retain_batch_cache(&self, cache: &mut Self::Cache, scheduler: &ContinuousBatchScheduler);
+    fn sync_batch(&self, device: &B::Device) -> Result<(), GenerationError> {
+        B::sync(device).map_err(|e|GenerationError(e.to_string()))
+    }
+    fn lookahead_tokens(&self)->usize {0}
+    fn forward_batch_lookahead(&self,batch:&ScheduledBatch,_lookahead:&BTreeMap<RequestId,PagedKvAppendReservation>,
+        cache:&mut Self::Cache,device:&B::Device)->Result<Tensor<B,3>,GenerationError> {
+        self.forward_batch(batch,cache,device)
+    }
+    fn forward_batch_sampling(&self,batch:&ScheduledBatch,lookahead:&BTreeMap<RequestId,PagedKvAppendReservation>,
+        cache:&mut Self::Cache,device:&B::Device,_sampling:&mut BatchSamplingState)->Result<Tensor<B,3>,GenerationError> {
+        self.forward_batch_lookahead(batch,lookahead,cache,device)
+    }
+    fn select_batch_token(&self,_cache:&mut Self::Cache,_id:RequestId,values:&[f32],sampler:&mut Option<TokenSampler>)
+        ->Result<i32,GenerationError> {
+        match sampler {
+            Some(sampler)=>sampler.sample(values),
+            None=>super::sampling::greedy_token(values,0).map_err(|e|GenerationError(e.to_string())),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -28,10 +47,10 @@ pub struct ExecutedBatch {
 /// Synchronous batch boundaries with asynchronous GPU work inside each forward.
 /// The model is borrowed once; weights are shared across all resident requests.
 pub struct DeviceBatchExecutor<'a, B: Backend, M: DeviceBatchModel<B>> {
-    model: &'a M,
-    device: B::Device,
-    scheduler: ContinuousBatchScheduler,
-    cache: M::Cache,
+    pub(super) model: &'a M,
+    pub(super) device: B::Device,
+    pub(super) scheduler: ContinuousBatchScheduler,
+    pub(super) cache: M::Cache,
 }
 
 impl<'a, B: Backend, M: DeviceBatchModel<B>> DeviceBatchExecutor<'a, B, M> {
@@ -91,32 +110,43 @@ impl<'a, B: Backend, M: DeviceBatchModel<B>> DeviceBatchExecutor<'a, B, M> {
     }
 
     pub fn step(&mut self) -> Result<Option<ExecutedBatch>, ContinuousBatchError> {
-        self.step_inner(None)
+        self.step_inner(None,None)
     }
 
     pub fn step_with_logits_processor(
         &mut self,
         mut processor: impl FnMut(RequestId, &mut [f32]) -> Result<(), GenerationError>,
     ) -> Result<Option<ExecutedBatch>, ContinuousBatchError> {
-        self.step_inner(Some(&mut processor))
+        self.step_inner(Some(&mut processor),None)
     }
 
-    fn step_inner(
+    pub(super) fn step_inner(
         &mut self,
         processor: Option<&mut dyn FnMut(RequestId, &mut [f32]) -> Result<(), GenerationError>>,
+        observer: Option<&mut dyn FnMut(&ScheduledBatch,&M::Cache,&Tensor<B,3>)>,
     ) -> Result<Option<ExecutedBatch>, ContinuousBatchError> {
         let Some(batch) = self.scheduler.schedule()? else {
             return Ok(None);
         };
         let mut working = self.model.fork_batch_cache(&self.cache);
+        let lookahead=match self.scheduler.reserve_lookahead(&batch,self.model.lookahead_tokens()) {
+            Ok(reserved)=>reserved,
+            Err(error)=>{self.scheduler.fail_batch(batch.id)?;return Err(error);},
+        };
         let vocabulary = self.model.batch_limits().vocab_size;
+        let mut sampling=match self.scheduler.batch_sampling_state(batch.id) {
+            Ok(sampling)=>sampling,
+            Err(error)=>{self.scheduler.fail_batch(batch.id)?;return Err(error);},
+        };
+        let mut saved_logits=None;
         let result = self
             .model
-            .forward_batch(&batch, &mut working, &self.device)
+            .forward_batch_sampling(&batch, &lookahead, &mut working, &self.device, &mut sampling)
             .and_then(|logits| {
                 if logits.dims() != [batch.batch_size(), 1, vocabulary] {
                     return Err(GenerationError("device batch logit shape mismatch".into()));
                 }
+                if observer.is_some() {saved_logits=Some(logits.clone());}
                 logits
                     .cast(FloatDType::F32)
                     .try_into_data()
@@ -126,8 +156,14 @@ impl<'a, B: Backend, M: DeviceBatchModel<B>> DeviceBatchExecutor<'a, B, M> {
             });
         // An error/panic is not evidence of device completion. A failed sync
         // leaves this batch in flight; its pages cannot be cancelled or reused.
-        B::sync(&self.device)
+        self.model.sync_batch(&self.device)
             .map_err(|e| ContinuousBatchError(format!("batch completion: {e}")))?;
+        if result.is_ok() {
+            if let (Some(observer),Some(logits))=(observer,saved_logits.as_ref()) {
+                observer(&batch,&working,logits);
+                self.model.sync_batch(&self.device).map_err(|e|ContinuousBatchError(format!("batch prefix completion: {e}")))?;
+            }
+        }
         let selection = result
             .map_err(|e| ContinuousBatchError(e.to_string()))
             .and_then(|mut values| {
@@ -137,12 +173,15 @@ impl<'a, B: Backend, M: DeviceBatchModel<B>> DeviceBatchExecutor<'a, B, M> {
                         .iter()
                         .zip(values.chunks_exact_mut(vocabulary))
                     {
+                        if sequence.context_length<self.scheduler.active[&sequence.request_id].prompt_token_ids.len() {continue;}
                         processor(sequence.request_id, row)
                             .map_err(|e| ContinuousBatchError(e.to_string()))?;
                     }
                 }
                 self.scheduler
-                    .select_batch_tokens(batch.id, &values, vocabulary)
+                    .select_batch_tokens_with(batch.id, &values, vocabulary, sampling, |id,row,sampler|
+                        self.model.select_batch_token(&mut working,id,row,sampler)
+                            .map_err(|e|ContinuousBatchError(e.to_string())))
             });
         let selection = match selection {
             Ok(selection) => selection,

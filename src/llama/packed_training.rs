@@ -5,7 +5,7 @@ use ruda_nn::loss::PackedCausalLanguageModel;
 
 fn rotate_documents<B: Backend>(
     input: Tensor<B, 3>, layout: &PackedSequenceLayout,
-    rope: &RotaryEncoding<B>, rotary_layout: RotaryLayout,
+    rope: &RotaryEncoding<B>, rotary_layout: RotaryLayout, state: Option<&rope::RotaryState>,
 ) -> Tensor<B, 3> {
     let [tokens, heads, width] = input.dims();
     if tokens == 0 { return input; }
@@ -15,10 +15,10 @@ fn rotate_documents<B: Backend>(
         if length == 0 { continue; }
         let document = input.clone().slice_dim(0, range[0]..range[1])
             .reshape([1, length, heads, width]).swap_dims(1, 2);
-        let rotated = match rotary_layout {
+        let rotated = if let Some(state) = state { state.fresh().apply(document, 0, layout.max_length()) } else { match rotary_layout {
             RotaryLayout::Interleaved => rope.apply(document, 0),
             RotaryLayout::HalfSplit => apply_half_split_rope(rope, document, 0),
-        };
+        }};
         documents.push(rotated.swap_dims(1, 2).reshape([length, heads, width]));
     }
     Tensor::cat(documents, 0)
@@ -27,11 +27,11 @@ fn rotate_documents<B: Backend>(
 fn attend_documents<B: Backend>(
     query: Tensor<B, 3>, key: Tensor<B, 3>, value: Tensor<B, 3>,
     layout: &PackedSequenceLayout, rope: &RotaryEncoding<B>,
-    rotary_layout: RotaryLayout, output: &Linear<B>,
+    rotary_layout: RotaryLayout, state: Option<&rope::RotaryState>, output: &Linear<B>,
 ) -> Tensor<B, 2> {
     let [tokens, heads, width] = query.dims();
-    let query = rotate_documents(query, layout, rope, rotary_layout);
-    let key = rotate_documents(key, layout, rope, rotary_layout);
+    let query = rotate_documents(query, layout, rope, rotary_layout, state);
+    let key = rotate_documents(key, layout, rope, rotary_layout, state);
     let options = PackedAttentionOptions { causal: true, ..Default::default() };
     let context = packed_scaled_dot_product_attention(query, key, value, layout, layout, options, None);
     output.forward(context.reshape([tokens, heads * width]))
@@ -43,7 +43,7 @@ impl<B: Backend> LlamaAttention<B> {
         let query = self.q_proj.forward(input.clone()).reshape([tokens, self.num_query_heads, self.head_dimension]);
         let key = self.k_proj.forward(input.clone()).reshape([tokens, self.num_kv_heads, self.head_dimension]);
         let value = self.v_proj.forward(input).reshape([tokens, self.num_kv_heads, self.head_dimension]);
-        attend_documents(query, key, value, layout, &self.rope, self.rotary_layout, &self.o_proj)
+        attend_documents(query, key, value, layout, &self.rope, self.rotary_layout, self.rotary_state.as_ref(), &self.o_proj)
     }
 }
 
@@ -61,7 +61,7 @@ impl<B: Backend> PackedLlamaAttention<B> {
             .reshape([tokens, self.num_kv_heads, self.head_dimension]);
         let value = projected.slice_dim(1, query_width + kv_width..query_width + 2 * kv_width)
             .reshape([tokens, self.num_kv_heads, self.head_dimension]);
-        attend_documents(query, key, value, layout, &self.rope, self.rotary_layout, &self.o_proj)
+        attend_documents(query, key, value, layout, &self.rope, self.rotary_layout, self.rotary_state.as_ref(), &self.o_proj)
     }
 }
 

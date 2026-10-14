@@ -6,7 +6,7 @@ use ruda_tensor_tch::{LibTorch, TchElement};
 type Torch<E> = LibTorch<E>;
 
 impl<E: TchElement> Mlp<Torch<E>> {
-    fn forward(&self, input: Tensor<Torch<E>, 3>) -> Tensor<Torch<E>, 3> {
+    pub(super) fn forward(&self, input: Tensor<Torch<E>, 3>) -> Tensor<Torch<E>, 3> {
         let gate = self.gate.forward(input.clone());
         let dtype = gate.dtype();
         self.down
@@ -204,6 +204,15 @@ impl<E: TchElement> Layer<Torch<E>> {
         state: &mut LayerCache<Torch<E>>,
         position: usize,
     ) -> Result<Tensor<Torch<E>, 3>, GenerationError> {
+        self.forward_reduced(hidden, config, cos, sin, state, position, None)
+    }
+
+    fn forward_reduced(
+        &self, hidden: Tensor<Torch<E>, 3>, config: &Qwen35TextConfig,
+        cos: Tensor<Torch<E>, 4>, sin: Tensor<Torch<E>, 4>,
+        state: &mut LayerCache<Torch<E>>, position: usize,
+        reduction: Option<&Reduction<Torch<E>>>,
+    ) -> Result<Tensor<Torch<E>, 3>, GenerationError> {
         let normalized = self.input_norm.forward(hidden.clone())?;
         let update = match (&self.mixer, state) {
             (Mixer::Full(attn), LayerCache::Full { key, value }) => {
@@ -214,8 +223,11 @@ impl<E: TchElement> Layer<Torch<E>> {
             }
             _ => return Err(GenerationError("Qwen3.5 cache layer type mismatch".into())),
         };
+        let update = match reduction { Some(reduce) => reduce(update), None => update };
         let hidden = hidden + update;
-        Ok(hidden.clone() + self.mlp.forward(self.post_norm.forward(hidden)?))
+        let update = self.mlp.forward(self.post_norm.forward(hidden.clone())?)?;
+        let update = match reduction { Some(reduce) => reduce(update), None => update };
+        Ok(hidden + update)
     }
 }
 
@@ -240,25 +252,28 @@ impl<E: TchElement> Qwen35TextModel<Torch<E>> {
             ));
         }
         let mut hidden = self.embedding.forward(tokens);
+        let rotary = self.rotary_for(cache)?;
         let (cos, sin) = attention::text_rope(
-            &self.config,
+            &rotary,
             cache.position,
             sequence,
             hidden.dtype(),
             &hidden.device(),
         );
         for (layer, state) in self.layers.iter().zip(cache.layers.iter_mut()) {
-            hidden = layer.forward(
+            hidden = layer.forward_reduced(
                 hidden,
                 &self.config,
                 cos.clone(),
                 sin.clone(),
                 state,
                 cache.position,
+                self.reduction.as_ref(),
             )?;
         }
         cache.position += sequence;
         cache.batch = Some(batch);
+        cache.rotary_length = rotary.cached_length();
         Ok(hidden)
     }
 

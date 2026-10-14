@@ -47,6 +47,7 @@ impl ContinuousBatchScheduler {
     ) -> Result<Option<CancelledGeneration>, ContinuousBatchError> {
         if let Some(position) = self.pending.iter().position(|request| request.id == request_id) {
             let request = self.pending.remove(position).expect("pending position was found");
+            self.deferred_prefill.remove(&request_id);
             return Ok(Some(CancelledGeneration {
                 request_id,
                 prompt_token_ids: request.prompt_token_ids,
@@ -63,6 +64,7 @@ impl ContinuousBatchScheduler {
         // Fallible cleanup happens before removing the request metadata.
         self.kv_cache.remove_sequence(request_id)?;
         let request = self.active.remove(&request_id).expect("active request was found");
+        self.deferred_prefill.remove(&request_id);
         Ok(Some(CancelledGeneration {
             request_id,
             prompt_token_ids: request.prompt_token_ids,
@@ -91,10 +93,10 @@ impl ContinuousBatchScheduler {
 mod tests;
 
 impl ContinuousBatchScheduler {
-    /// Lowest useful token limit without implementing chunked prefill. This
-    /// avoids an OOM retry policy reducing the limit below a waiting prompt and
-    /// silently stranding it forever. Decode-only work has a minimum of one.
+    /// Lowest useful token limit; chunked prefill can advance one token at a
+    /// time, whereas whole-prompt prefill must fit every waiting prompt.
     pub fn minimum_batch_token_limit(&self) -> usize {
+        if self.prefill_chunk_tokens.is_some() { return 1; }
         self.pending.iter().map(|r| r.prompt_token_ids.len())
             .chain(self.active.values().filter(|r| r.phase == RequestPhase::NeedsPrefill)
                 .map(|r| r.prompt_token_ids.len()))

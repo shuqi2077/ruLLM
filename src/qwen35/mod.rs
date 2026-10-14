@@ -1,19 +1,24 @@
 mod attention;
 mod batching;
-pub use batching::Qwen35BatchCache;
+pub use batching::{Qwen35BatchCache,Qwen35BatchDelta};
 mod cache_record;
 pub use cache_record::{Qwen35CacheRecord,Qwen35LayerCacheState};
 mod config;
 mod delta;
 mod layer;
+mod moe;
+use moe::FeedForward;
 #[cfg(feature = "libtorch")]
 mod libtorch;
 #[cfg(feature = "libtorch")]
 mod libtorch_delta;
 mod loading;
 mod quantized_loading;
+mod fp8_loading;
 mod projection;
 use projection::Projection;
+#[cfg(feature = "tensor-parallel")]
+pub(crate) mod parallel;
 mod vision;
 mod multimodal;
 pub use multimodal::{Qwen35MultimodalCache, Qwen35MultimodalModel, load_huggingface_qwen35_multimodal};
@@ -25,7 +30,7 @@ mod tests;
 
 use crate::{CausalModel, GenerationError};
 use config::LayerType;
-pub use config::{LayerType as Qwen35LayerType, Qwen35TextConfig, RopeConfig as Qwen35RopeConfig};
+pub use config::{LayerType as Qwen35LayerType, Qwen35MoeConfig, Qwen35TextConfig, RopeConfig as Qwen35RopeConfig};
 pub use loading::{LoadedQwen35Text, load_huggingface_qwen35_text, load_huggingface_qwen35_text_packed};
 use ruda::runtime::server::ComputeServer;
 use ruda_nn::{Embedding, Linear};
@@ -82,16 +87,20 @@ struct Layer<B: Backend> {
     mixer: Mixer<B>,
     input_norm: Norm<B>,
     post_norm: Norm<B>,
-    mlp: Mlp<B>,
+    mlp: FeedForward<B>,
 }
 
 pub struct Qwen35TextModel<B: Backend> {
     pub config: Qwen35TextConfig,
+    rotary: crate::llama::rope::RopeParameters,
     embedding: Embedding<B>,
     layers: Vec<Layer<B>>,
     norm: Norm<B>,
     head: Projection<B>,
+    reduction: Option<Reduction<B>>,
 }
+
+type Reduction<B: Backend> = std::sync::Arc<dyn Fn(Tensor<B, 3>) -> Tensor<B, 3> + Send + Sync>;
 
 #[derive(Clone)]
 enum LayerCache<B: Backend> {
@@ -110,6 +119,7 @@ pub struct Qwen35Cache<B: Backend> {
     layers: Vec<LayerCache<B>>,
     position: usize,
     batch: Option<usize>,
+    rotary_length: usize,
 }
 
 impl<B: Backend> Qwen35Cache<B> {
@@ -119,6 +129,21 @@ impl<B: Backend> Qwen35Cache<B> {
 }
 
 impl<B: Backend> Qwen35TextModel<B> {
+    pub fn set_context_limit(&mut self, length: usize) -> Result<(), GenerationError> {
+        if length == 0 || (length > self.config.max_position_embeddings
+            && matches!(self.rotary.scaling, crate::llama::rope::RopeScaling::Static)) {
+            return Err(GenerationError("context extension requires runtime-scaled Qwen3.5 RoPE".into()));
+        }
+        self.config.max_position_embeddings = length;
+        Ok(())
+    }
+    fn rotary_for(&self, cache: &Qwen35Cache<B>) -> Result<crate::llama::rope::RotaryState, GenerationError> {
+        self.rotary.state_at(cache.rotary_length)
+            .ok_or_else(|| GenerationError("Qwen3.5 cache rotary state differs from the model".into()))
+    }
+    fn reduce(&self, value: Tensor<B, 3>) -> Tensor<B, 3> {
+        match &self.reduction { Some(reduce) => reduce(value), None => value }
+    }
     pub fn new_cache(&self) -> Qwen35Cache<B> {
         Qwen35Cache {
             layers: self
@@ -138,6 +163,7 @@ impl<B: Backend> Qwen35TextModel<B> {
                 .collect(),
             position: 0,
             batch: None,
+            rotary_length: self.rotary.initial_cached_length(),
         }
     }
 }
@@ -194,14 +220,17 @@ where
             ));
         }
         let hidden = self.embedding.forward(tokens);
+        let rotary = self.rotary_for(cache)?;
         let (cos, sin) = attention::text_rope(
-            &self.config,
+            &rotary,
             cache.position,
             sequence,
             hidden.dtype(),
             &hidden.device(),
         );
-        self.run_layers(hidden, cos, sin, cache)
+        let hidden = self.run_layers(hidden, cos, sin, cache)?;
+        cache.rotary_length = rotary.cached_length();
+        Ok(hidden)
     }
 
     fn forward_embeddings_last(
@@ -218,10 +247,12 @@ where
         {
             return Err(GenerationError("invalid Qwen3.5 embedded input or cache capacity".into()));
         }
-        let (cos, sin) = attention::multimodal_rope(
-            &self.config, coordinates, batch, sequence, hidden.dtype(), &hidden.device(),
+        let rotary = self.rotary_for(cache)?;
+        let (cos, sin) = attention::multimodal_rope_with_state(
+            &self.config, &rotary, coordinates, batch, sequence, hidden.dtype(), &hidden.device(),
         )?;
         let hidden = self.run_layers(hidden, cos, sin, cache)?;
+        cache.rotary_length = rotary.cached_length();
         Ok(self.head.forward(self.norm.forward(hidden.slice([0..batch, sequence-1..sequence, 0..width]))?))
     }
 
@@ -245,7 +276,7 @@ where
     ) -> Result<Tensor<DeviceBackend<R, F, I, BT>, 3>, GenerationError> {
         let [batch, sequence, _] = hidden.dims();
         for (index, (layer, state)) in self.layers.iter().zip(cache.layers.iter_mut()).enumerate() {
-            hidden = layer.forward(hidden, &self.config, cos.clone(), sin.clone(), state, cache.position)?;
+            hidden = layer.forward_reduced(hidden, &self.config, cos.clone(), sin.clone(), state, cache.position, self.reduction.as_ref())?;
             observe(index, &hidden);
         }
         cache.position += sequence;

@@ -87,6 +87,14 @@ impl<R: DeviceRuntime> AwqLlamaForCausalLm<R>
 where
     R::Device: DeviceOps,
 {
+    pub fn set_context_limit(&mut self, length: usize) -> Result<(), crate::GenerationError> {
+        if length == 0 || self.layers.iter().any(|layer| layer.self_attn.rotary_state.is_none()
+            && layer.self_attn.rope.freq_complex.dims()[0] < length) {
+            return Err(crate::GenerationError("context extension requires runtime-scaled RoPE in every extended layer".into()));
+        }
+        self.max_sequence_length = length;
+        Ok(())
+    }
     pub fn new_cache(&self) -> LlamaKvCache<AwqBackend<R>> {
         LlamaKvCache::new(self.layers.len(), self.max_sequence_length)
     }

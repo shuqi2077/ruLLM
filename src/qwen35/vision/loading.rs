@@ -39,7 +39,7 @@ pub fn load_huggingface_qwen35_vision<B: Backend>(
         &std::fs::read(&config_path).map_err(|e| HuggingFaceLoadError(e.to_string()))?,
     )
     .map_err(|e| HuggingFaceLoadError(e.to_string()))?;
-    if raw["model_type"] != "qwen3_5"
+    if !matches!(raw["model_type"].as_str(), Some("qwen3_5" | "qwen3_5_moe"))
         || raw.get("quantization_config").is_some_and(|v| !v.is_null())
         || raw["vision_config"]
             .get("quantization_config")
@@ -59,6 +59,7 @@ pub fn load_huggingface_qwen35_vision<B: Backend>(
         quantization: None,
         quantized_dtype: DType::F32,
         dequantized_awq_linears: 0, packed_awq_linears: 0, packed_loader: None,
+        fp8: None,
     };
     let base = "model.visual";
     let patch_weight = w.tensor(

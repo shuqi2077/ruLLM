@@ -1,4 +1,4 @@
-use super::{Qwen3Config, Qwen3Model, Shard, load_rank};
+use super::{Qwen3Config, Qwen3Model,Qwen3Drafted, Shard, load_rank};
 use crate::{
     CausalModel, GenerationCacheContinuation, GenerationError, HuggingFaceLoadError,
     HuggingFaceLoadReport, LlamaKvCache, LlamaKvCacheRecord, SpeculativeModel,
@@ -8,9 +8,22 @@ use ruda_tensor::api::{Int, Tensor, TensorPrimitive};
 use ruda_tensor::device::Device;
 use ruda_tensor::distributed::{DistributedBackend, ReduceOperation};
 use std::{path::Path, sync::Arc};
+use crate::{DeviceBatchModel,PrefixBatchModel};
+crate::parallel_batch::parallel_batch_model!(Qwen3TensorParallel,Qwen3Model,|group|
+    crate::PrefixShard{kv_heads:Some(group.config.num_key_value_heads),..Default::default()});
+crate::parallel_batch::parallel_speculative_model!(Qwen3TensorParallel,Qwen3Model);
+crate::parallel_batch::parallel_batch_model!(Qwen3DraftTensorParallel,Qwen3Drafted,|group|
+    crate::PrefixShard{kv_heads:Some(group.config.num_key_value_heads),..Default::default()});
+
+pub struct Qwen3DraftTensorParallel<B:DistributedBackend> {
+    pub config:Qwen3Config,
+    ranks:Vec<Qwen3Drafted<B>>,
+    devices:Vec<B::Device>,
+}
 
 pub struct Qwen3TensorParallel<B: DistributedBackend> {
     pub config: Qwen3Config,
+    pub moe_config: Option<super::Qwen3MoeConfig>,
     ranks: Vec<Qwen3Model<B>>,
     devices: Vec<B::Device>,
 }
@@ -41,11 +54,7 @@ pub fn load_huggingface_qwen3_tensor_parallel<B: DistributedBackend>(
             "TP requires a nonempty group of distinct native devices".into(),
         ));
     }
-    let config: Qwen3Config = serde_json::from_slice(
-        &std::fs::read(directory.as_ref().join("config.json"))
-            .map_err(|e| HuggingFaceLoadError(e.to_string()))?,
-    )
-    .map_err(|e| HuggingFaceLoadError(e.to_string()))?;
+    let (config, moe_config) = super::read_config(directory.as_ref())?;
     config.validate()?;
     let mut ranks = Vec::with_capacity(devices.len());
     let mut reports = Vec::with_capacity(devices.len());
@@ -85,6 +94,7 @@ pub fn load_huggingface_qwen3_tensor_parallel<B: DistributedBackend>(
     Ok(LoadedQwen3TensorParallel {
         model: Qwen3TensorParallel {
             config,
+            moe_config,
             ranks,
             devices,
         },
@@ -94,6 +104,13 @@ pub fn load_huggingface_qwen3_tensor_parallel<B: DistributedBackend>(
 }
 
 impl<B: DistributedBackend> Qwen3TensorParallel<B> {
+    /// Replicated lightweight drafter; the target remains tensor-sharded.
+    /// All target verification forwards run concurrently across the rank group.
+    pub fn with_draft(self,directory:impl AsRef<Path>)->Result<Qwen3DraftTensorParallel<B>,HuggingFaceLoadError> {
+        let mut ranks=Vec::with_capacity(self.ranks.len());
+        for target in self.ranks {ranks.push(super::draft::load_draft_rank(target,directory.as_ref(),true)?);}
+        Ok(Qwen3DraftTensorParallel{config:self.config,ranks,devices:self.devices})
+    }
     pub fn devices(&self) -> &[B::Device] {
         &self.devices
     }

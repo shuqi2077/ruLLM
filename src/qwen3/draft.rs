@@ -13,16 +13,13 @@ use ruda_tensor::api::{
 };
 use serde::Deserialize;
 use std::{collections::BTreeSet, marker::PhantomData, path::Path};
+mod batching;
+pub use batching::{Qwen3DraftBatchCache,Qwen3DraftBatchPrefix};
 
 #[derive(Deserialize)]
 struct DraftInner {
     mask_token_id: i32,
     target_layer_ids: Vec<usize>,
-}
-#[derive(Deserialize)]
-struct Rope {
-    rope_theta: f64,
-    rope_type: String,
 }
 #[derive(Deserialize)]
 struct DraftConfig {
@@ -38,7 +35,11 @@ struct DraftConfig {
     max_position_embeddings: usize,
     block_size: usize,
     rope_theta: Option<f64>,
-    rope_parameters: Option<Rope>,
+    rope_parameters: Option<serde_json::Value>,
+    rope_scaling: Option<serde_json::Value>,
+    original_max_position_embeddings: Option<usize>,
+    partial_rotary_factor: Option<f64>,
+    layer_types: Option<Vec<String>>,
     dflash_config: Option<DraftInner>,
     mask_token_id: Option<i32>,
     target_layer_ids: Option<Vec<usize>>,
@@ -63,7 +64,7 @@ struct Draft<B: Backend> {
     config: DraftConfig,
     taps: Vec<usize>,
     mask: i32,
-    theta: f64,
+    rotary: Vec<crate::llama::rope::RotaryState>,
     anchor_first: bool,
     layers: Vec<Layer<B>>,
     fc: Projection<B>,
@@ -101,35 +102,6 @@ fn append_features<B: Backend>(pending: &mut Option<Tensor<B, 3>>, features: Ten
 }
 
 impl<B: Backend> Draft<B> {
-    fn rotary(
-        &self,
-        start: usize,
-        count: usize,
-        device: &B::Device,
-        dtype: DType,
-    ) -> (Tensor<B, 4>, Tensor<B, 4>) {
-        let width = self.config.head_dim;
-        let inverse = (0..width / 2)
-            .map(|i| 1.0f32 / (self.theta as f32).powf((2 * i) as f32 / width as f32))
-            .collect::<Vec<_>>();
-        let frequencies = Tensor::<B, 2>::from_data(
-            TensorData::new(
-                (start..start + count).map(|i| i as f32).collect::<Vec<_>>(),
-                [count, 1],
-            ),
-            (device, DType::F32),
-        ) * Tensor::<B, 2>::from_data(
-            TensorData::new(inverse, [1, width / 2]),
-            (device, DType::F32),
-        );
-        let frequencies =
-            Tensor::cat(vec![frequencies.clone(), frequencies], 1).reshape([1, 1, count, width]);
-        (
-            frequencies.clone().cos().cast(dtype),
-            frequencies.sin().cast(dtype),
-        )
-    }
-
     fn propose(
         &self,
         target: &Qwen3Model<B>,
@@ -170,13 +142,16 @@ impl<B: Backend> Draft<B> {
                 .clone()
                 .select(0, ids)
                 .reshape([1, c.block_size, c.hidden_size]);
-        let (query_cos, query_sin) = self.rotary(cache.position, c.block_size, &device, dtype);
-        let (key_cos, key_sin) = self.rotary(old, context_len + c.block_size, &device, dtype);
         let full_length = cache.position + c.block_size;
-        for (layer, state) in self.layers.iter().zip(&mut cache.draft.layers) {
+        for (index, (layer, state)) in self.layers.iter().zip(&mut cache.draft.layers).enumerate() {
             if state.sequence_length() != old {
                 return Err(GenerationError("draft KV positions differ".into()));
             }
+            let rotary = self.rotary[index].for_cache(&state.rotary, old)?;
+            let (query_cos, query_sin) = rotary.cos_sin((cache.position..full_length).map(|p|p as f32).collect(),
+                1,c.block_size,full_length,dtype,&device);
+            let (key_cos, key_sin) = rotary.cos_sin((old..full_length).map(|p|p as f32).collect(),
+                1,context_len+c.block_size,full_length,dtype,&device);
             let normalized = norm(hidden.clone(), &layer.input_norm, c.rms_norm_eps);
             let query = norm(
                 layer.q.forward(normalized.clone()).reshape([
@@ -214,6 +189,7 @@ impl<B: Backend> Draft<B> {
             let query = rotate(query, query_cos.clone(), query_sin.clone());
             let key = rotate(key, key_cos.clone(), key_sin.clone());
             let (key, value, end) = state.append_growable(key, value);
+            state.rotary.commit(&rotary,end)?;
             if end != full_length {
                 return Err(GenerationError("draft KV append span differs".into()));
             }
@@ -226,10 +202,7 @@ impl<B: Backend> Draft<B> {
                 .reshape([1, c.block_size, c.num_attention_heads * c.head_dim]);
             hidden = hidden + layer.o.forward(attended);
             let normalized = norm(hidden.clone(), &layer.post_norm, c.rms_norm_eps);
-            hidden = hidden
-                + layer.down.forward(
-                    silu(layer.gate.forward(normalized.clone())) * layer.up.forward(normalized),
-                );
+            hidden = hidden + layer.mlp.forward(normalized)?;
         }
         cache.draft.position = full_length;
         cache.draft.truncate(cache.position)?;
@@ -501,10 +474,7 @@ impl<B: Backend> GenerationCacheContinuation<B> for Qwen3DraftCache<B> {
         {
             return Err(invalid("identity or draft feature geometry differs"));
         }
-        let draft_item = record
-            .draft
-            .into_item::<ruda_model::record::FullPrecisionSettings>();
-        let draft_position = draft_item.2;
+        let draft_position = record.draft.position();
         if draft_position > position {
             return Err(invalid("draft context is ahead of committed target"));
         }
@@ -521,9 +491,7 @@ impl<B: Backend> GenerationCacheContinuation<B> for Qwen3DraftCache<B> {
             device,
         )?;
         let draft = LlamaKvCache::restore_generation(
-            LlamaKvCacheRecord::from_item::<ruda_model::record::FullPrecisionSettings>(
-                draft_item, device,
-            ),
+            record.draft,
             &format!("{model_id}:draft"),
             &template.draft,
             draft_position,
@@ -572,6 +540,11 @@ pub fn load_huggingface_qwen3_draft<B: Backend>(
     target: Qwen3Model<B>,
     directory: impl AsRef<Path>,
 ) -> Result<Qwen3Drafted<B>, HuggingFaceLoadError> {
+    load_draft_rank(target,directory,false)
+}
+
+pub(super) fn load_draft_rank<B:Backend>(target:Qwen3Model<B>,directory:impl AsRef<Path>,sharded:bool)
+    ->Result<Qwen3Drafted<B>,HuggingFaceLoadError> {
     let directory = directory
         .as_ref()
         .canonicalize()
@@ -594,17 +567,13 @@ pub fn load_huggingface_qwen3_draft<B: Backend>(
                 .ok_or_else(|| HuggingFaceLoadError("target feature layers missing".into()))?,
         ),
     };
-    let theta = match (&config.rope_parameters, config.rope_theta) {
-        (Some(rope), _) if rope.rope_type == "default" => rope.rope_theta,
-        (None, Some(theta)) => theta,
-        _ => {
-            return Err(HuggingFaceLoadError(
-                "unsupported draft RoPE definition".into(),
-            ));
-        }
-    };
+    let parameters = crate::huggingface::rope::layer_parameters(config.head_dim,config.max_position_embeddings,
+        config.rope_theta.unwrap_or(f64::NAN),config.original_max_position_embeddings,config.partial_rotary_factor.unwrap_or(1.0),
+        config.rope_parameters.as_ref().filter(|v|!v.is_null()).or_else(||config.rope_scaling.as_ref().filter(|v|!v.is_null())),
+        config.layer_types.as_deref(),config.num_hidden_layers)?;
+    let rotary = (0..config.num_hidden_layers).map(|index|parameters.for_layer(index).state()).collect();
     let anchor_first = config.num_anchors.is_some() || config.markov_rank > 0;
-    if target.reduction.is_some()
+    if (target.reduction.is_some() && !sharded)
         || [
             config.hidden_size,
             config.intermediate_size,
@@ -636,8 +605,6 @@ pub fn load_huggingface_qwen3_draft<B: Backend>(
         || config.attention_bias
         || config.attention_dropout != 0.0
         || config.use_sliding_window
-        || !theta.is_finite()
-        || theta <= 0.0
         || !config.rms_norm_eps.is_finite()
         || config.rms_norm_eps <= 0.0
         || config.markov_rank > 0 && config.markov_head_type.as_deref() != Some("vanilla")
@@ -646,7 +613,7 @@ pub fn load_huggingface_qwen3_draft<B: Backend>(
             .as_ref()
             .is_some_and(|v| !v.is_null())
     {
-        return Err(HuggingFaceLoadError("requires a compatible floating DFlash/vanilla DSpark drafter and a single-rank Qwen3 target".into()));
+        return Err(HuggingFaceLoadError("requires a compatible floating DFlash/vanilla DSpark drafter and Qwen3 target; sharded targets need the parallel batch loader".into()));
     }
     let device = target.embedding.device();
     let dtype = target.embedding.dtype();
@@ -696,6 +663,7 @@ pub fn load_huggingface_qwen3_draft<B: Backend>(
                 h,
                 &device,
             )?,
+            mlp: super::moe::FeedForward::Dense(super::moe::Mlp {
             gate: projection(
                 &mut checkpoint,
                 &format!("{p}.mlp.gate_proj"),
@@ -717,6 +685,7 @@ pub fn load_huggingface_qwen3_draft<B: Backend>(
                 h,
                 &device,
             )?,
+            }),
             input_norm: checkpoint.tensor(&format!("{p}.input_layernorm.weight"), [h], &device)?,
             post_norm: checkpoint.tensor(
                 &format!("{p}.post_attention_layernorm.weight"),
@@ -825,7 +794,7 @@ pub fn load_huggingface_qwen3_draft<B: Backend>(
             config,
             taps,
             mask,
-            theta,
+            rotary,
             anchor_first,
             layers,
             fc,

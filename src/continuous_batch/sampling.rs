@@ -1,5 +1,8 @@
 use super::{ContinuousBatchError, ContinuousBatchScheduler, RequestPhase};
 use crate::{GreedyGenerationConfig, RequestId, SamplingGenerationConfig, TokenSampler};
+use std::collections::BTreeMap;
+
+pub type BatchSamplingState = BTreeMap<RequestId, Option<TokenSampler>>;
 
 /// Selection state is committed only together with the corresponding batch.
 pub(crate) struct BatchTokenSelection {
@@ -33,6 +36,25 @@ impl ContinuousBatchScheduler {
         logits: &[f32],
         vocabulary: usize,
     ) -> Result<BatchTokenSelection, ContinuousBatchError> {
+        self.select_batch_tokens_with(batch_id, logits, vocabulary, self.batch_sampling_state(batch_id)?,
+            |_, values, sampler| match sampler {
+                Some(sampler) => sampler.sample(values).map_err(|e| ContinuousBatchError(e.to_string())),
+                None => greedy_token(values, 0),
+            })
+    }
+
+    pub(crate) fn batch_sampling_state(&self, batch_id: u64) -> Result<BatchSamplingState, ContinuousBatchError> {
+        let batch = self.in_flight.as_ref().filter(|b| b.id == batch_id)
+            .ok_or_else(|| ContinuousBatchError(format!("batch {batch_id} is not in flight")))?;
+        batch.sequences.iter().map(|row| self.active.get(&row.request_id)
+            .map(|request| (row.request_id, request.sampler.clone()))
+            .ok_or_else(|| ContinuousBatchError("sampling references missing request".into()))).collect()
+    }
+
+    pub(crate) fn select_batch_tokens_with(
+        &self, batch_id: u64, logits: &[f32], vocabulary: usize, mut state: BatchSamplingState,
+        mut select: impl FnMut(RequestId, &[f32], &mut Option<TokenSampler>) -> Result<i32, ContinuousBatchError>,
+    ) -> Result<BatchTokenSelection, ContinuousBatchError> {
         let batch = self
             .in_flight
             .as_ref()
@@ -59,18 +81,19 @@ impl ContinuousBatchScheduler {
                 )));
             }
             let values = &logits[row * vocabulary..(row + 1) * vocabulary];
-            if let Some(sampler) = &request.sampler {
-                let mut next = sampler.clone();
-                tokens.push(next.sample(values).map_err(|error| {
-                    ContinuousBatchError(format!("sampling batch row {row}: {error}"))
-                })?);
+            if sequence.context_length<request.prompt_token_ids.len() {
+                tokens.push(0);
+                continue;
+            }
+            let mut next = state.remove(&sequence.request_id)
+                .ok_or_else(|| ContinuousBatchError("missing transactional batch sampler".into()))?;
+            tokens.push(select(sequence.request_id, values, &mut next)?);
+            if let Some(mut next) = next {
                 // Batch previews retain RNG checkpoints, not one O(vocabulary)
                 // buffer per request. Streaming single requests still reuse
                 // their TokenSampler workspace across every decode step.
                 next.clear_workspace();
                 samplers.push((sequence.request_id, next));
-            } else {
-                tokens.push(greedy_token(values, row)?);
             }
         }
         Ok(BatchTokenSelection {
@@ -94,7 +117,7 @@ impl ContinuousBatchScheduler {
     }
 }
 
-fn greedy_token(row_values: &[f32], row: usize) -> Result<i32, ContinuousBatchError> {
+pub(super) fn greedy_token(row_values: &[f32], row: usize) -> Result<i32, ContinuousBatchError> {
     let mut best = None;
     for (index, &value) in row_values.iter().enumerate() {
         if value.is_nan() {

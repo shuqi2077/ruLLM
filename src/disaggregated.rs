@@ -13,6 +13,21 @@ use std::{
 
 const MAGIC: &[u8; 8] = b"RUDAKV01";
 
+mod batch;
+#[cfg(feature="gpu-kv")]
+mod gpu_transport;
+#[cfg(feature="gpu-kv")]
+mod gpu;
+#[cfg(feature="gpu-kv")]
+pub use gpu_transport::GpuKvConfig;
+#[cfg(feature="gpu-kv")]
+pub use gpu::run_gpu_batch_prefill_service;
+#[cfg(feature="gpu-kv")]
+pub(crate) use gpu::GpuRemoteNetwork;
+pub use batch::run_batch_prefill_service;
+#[cfg(feature="serving")]
+pub(crate) use batch::RemoteBatchNetwork;
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PrefillRequest {

@@ -17,6 +17,7 @@ mod awq;
 mod awq_model;
 mod pipeline;
 mod sampling;
+pub(crate) mod rope;
 pub(crate) mod checkpoint;
 
 pub use awq::{AwqCheckpoint, AwqQuantizationConfig};
@@ -48,6 +49,9 @@ struct HuggingFaceLlamaConfig {
     rope_theta: Option<f32>,
     rope_scaling: Option<serde_json::Value>,
     rope_parameters: Option<serde_json::Value>,
+    layer_types: Option<Vec<String>>,
+    original_max_position_embeddings: Option<usize>,
+    partial_rotary_factor: Option<f64>,
     hidden_act: Option<String>,
     attention_bias: Option<bool>,
     mlp_bias: Option<bool>,
@@ -190,9 +194,10 @@ pub fn load_huggingface_llama<B: Backend>(
     let model_directory = canonical_directory(model_directory.as_ref())?;
     let config_path = model_directory.join(CONFIG_FILE);
     let source: HuggingFaceLlamaConfig = read_json(&config_path)?;
+    let rotary = rope::parameters(&source)?;
     let (config, tied_word_embeddings, default_eos_token_ids) = convert_config(source)?;
     let weight_files = discover_weight_files(&model_directory)?;
-    let mut model = LlamaForCausalLm::<B>::init(&config, device)
+    let mut model = LlamaForCausalLm::<B>::init_huggingface(&config, &rotary, false, device)
         .map_err(|error| HuggingFaceLoadError(error.to_string()))?;
     let expected = expected_tensor_paths(config.num_hidden_layers, tied_word_embeddings);
     let mut applied = BTreeSet::new();
@@ -246,6 +251,7 @@ pub fn load_huggingface_llama<B: Backend>(
             unexpected.join(", ")
         )));
     }
+    model.restore_rope_storage(&config, &rotary, device);
     B::sync(device).map_err(|error| {
         HuggingFaceLoadError(format!("Ruda weight upload did not complete: {error}"))
     })?;
@@ -273,11 +279,12 @@ pub fn load_huggingface_qwen2<B: Backend>(
     let model_directory = canonical_directory(model_directory.as_ref())?;
     let config_path = model_directory.join(CONFIG_FILE);
     let source: HuggingFaceLlamaConfig = read_json(&config_path)?;
+    let rotary = rope::parameters(&source)?;
     let (config, tied_word_embeddings, config_eos_token_ids) = convert_qwen2_config(source)?;
     let default_eos_token_ids =
         load_generation_eos_token_ids(&model_directory, config.vocab_size, config_eos_token_ids)?;
     let weight_files = discover_weight_files(&model_directory)?;
-    let mut model = LlamaForCausalLm::<B>::init_qwen2(&config, device)
+    let mut model = LlamaForCausalLm::<B>::init_huggingface(&config, &rotary, true, device)
         .map_err(|error| HuggingFaceLoadError(error.to_string()))?;
     let expected = expected_qwen2_tensor_paths(config.num_hidden_layers, tied_word_embeddings);
     let mut applied = BTreeSet::new();
@@ -330,20 +337,7 @@ pub fn load_huggingface_qwen2<B: Backend>(
             unexpected.join(", ")
         )));
     }
-    let mut rotary_caches: Vec<(ruda_tensor::api::DType, ruda_nn::RotaryEncoding<B>)> = Vec::new();
-    for layer in &mut model.layers {
-        let dtype = layer.self_attn.q_proj.weight.val().dtype();
-        if layer.self_attn.rope.freq_complex.dtype() != dtype {
-            let rope = if let Some((_, rope)) = rotary_caches.iter().find(|(kind, _)| *kind == dtype) {
-                rope.clone()
-            } else {
-                let rope = crate::llama::rope::qwen2_rope_with_dtype::<B>(&config, device, dtype);
-                rotary_caches.push((dtype, rope.clone()));
-                rope
-            };
-            layer.self_attn.rope = rope;
-        }
-    }
+    model.restore_rope_storage(&config, &rotary, device);
     B::sync(device).map_err(|error| {
         HuggingFaceLoadError(format!("Ruda Qwen2 weight upload did not complete: {error}"))
     })?;
@@ -361,6 +355,11 @@ pub fn load_huggingface_qwen2<B: Backend>(
 }
 
 impl<B: Backend> LoadedHuggingFaceLlama<B> {
+    pub fn set_context_limit(&mut self, length: usize) -> Result<(), GenerationError> {
+        self.model.set_context_limit(length)?;
+        self.config.max_sequence_length = length;
+        Ok(())
+    }
     /// Decode token IDs with the loaded model. An empty EOS list inherits the
     /// exact `eos_token_id` value from Hugging Face `config.json`.
     pub fn generate_tokens(
@@ -383,6 +382,11 @@ impl<B: Backend> LoadedHuggingFaceLlama<B> {
 }
 
 impl<B: Backend> LoadedHuggingFaceQwen2<B> {
+    pub fn set_context_limit(&mut self, length: usize) -> Result<(), GenerationError> {
+        self.model.set_context_limit(length)?;
+        self.config.max_sequence_length = length;
+        Ok(())
+    }
     /// Decode with Qwen's architecture-specific model. An empty EOS list
     /// inherits the exact scalar or list value from `config.json`.
     pub fn generate_tokens(
@@ -401,6 +405,23 @@ impl<B: Backend> LoadedHuggingFaceQwen2<B> {
             &generation,
             device,
         )
+    }
+}
+
+#[cfg(feature = "tensor-parallel")]
+pub(crate) fn dense_parallel_config(
+    directory: &Path,
+    qwen2: bool,
+) -> Result<(LlamaConfig, bool, Vec<i32>, crate::llama::rope::RopeParameters), HuggingFaceLoadError> {
+    let source = read_json(&directory.join(CONFIG_FILE))?;
+    let rotary = rope::parameters(&source)?;
+    if qwen2 {
+        let (config, tied, eos) = convert_qwen2_config(source)?;
+        let eos = load_generation_eos_token_ids(directory, config.vocab_size, eos)?;
+        Ok((config, tied, eos, rotary))
+    } else {
+        let (config, tied, eos) = convert_config(source)?;
+        Ok((config, tied, eos, rotary))
     }
 }
 
@@ -447,15 +468,7 @@ fn convert_config(
             "Ruda Llama currently requires attention_dropout=0".into(),
         ));
     }
-    if source
-        .rope_scaling
-        .as_ref()
-        .is_some_and(|value| !value.is_null())
-    {
-        return Err(HuggingFaceLoadError(
-            "Ruda Llama does not yet implement Hugging Face rope_scaling variants".into(),
-        ));
-    }
+    let rotary = rope::parameters(&source)?;
     let num_kv_heads = source
         .num_key_value_heads
         .unwrap_or(source.num_attention_heads);
@@ -468,7 +481,7 @@ fn convert_config(
         num_kv_heads,
         max_sequence_length: source.max_position_embeddings,
         rms_norm_epsilon: source.rms_norm_eps,
-        rope_theta: source.rope_theta.unwrap_or(10_000.0),
+        rope_theta: rotary.theta,
     };
     config
         .validate()
@@ -543,19 +556,7 @@ fn convert_qwen2_config(
             "Ruda Qwen2 does not implement multimodal RoPE".into(),
         ));
     }
-    if source
-        .rope_scaling
-        .as_ref()
-        .is_some_and(|value| !value.is_null())
-        || source
-            .rope_parameters
-            .as_ref()
-            .is_some_and(|value| !value.is_null())
-    {
-        return Err(HuggingFaceLoadError(
-            "Ruda Qwen2 currently requires default, unscaled RoPE".into(),
-        ));
-    }
+    let rotary = rope::parameters(&source)?;
     let num_kv_heads = source
         .num_key_value_heads
         .unwrap_or(source.num_attention_heads);
@@ -568,7 +569,7 @@ fn convert_qwen2_config(
         num_kv_heads,
         max_sequence_length: source.max_position_embeddings,
         rms_norm_epsilon: source.rms_norm_eps,
-        rope_theta: source.rope_theta.unwrap_or(10_000.0),
+        rope_theta: rotary.theta,
     };
     config
         .validate()

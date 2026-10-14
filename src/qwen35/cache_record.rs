@@ -12,6 +12,7 @@ pub enum Qwen35LayerCacheState {
     Full {key: Option<TensorData>,value: Option<TensorData>},
     /// Native [batch,channels,window] history and FP32 [batch,heads,key,value] state.
     Delta {convolution: Option<TensorData>,state: Option<TensorData>},
+    Rotary {cached_length: usize},
 }
 
 /// Frozen exact-storage Qwen3.5 cache, original layer order and input position.
@@ -94,7 +95,11 @@ impl<B: Backend> Qwen35CacheRecord<B> {
             check_layer(&layer,cache.position,cache.batch)?;
             layers.push(layer);
         }
-        Ok(Self {version:1,model_id:model_id.into(),position:cache.position,batch:cache.batch,layers,backend:PhantomData})
+        let version = if cache.rotary_length == 0 { 1 } else {
+            layers.push(Qwen35LayerCacheState::Rotary {cached_length:cache.rotary_length});
+            2
+        };
+        Ok(Self {version,model_id:model_id.into(),position:cache.position,batch:cache.batch,layers,backend:PhantomData})
     }
 
     /// Save exact raw layer tensors, not recorder-narrowed homogeneous weights.
@@ -104,8 +109,17 @@ impl<B: Backend> Qwen35CacheRecord<B> {
 
     /// Restore original layer variants against this actual model's fresh cache.
     /// No full-attention history is substituted for recurrent state or vice versa.
-    pub fn restore(self,model_id: &str,template: &Qwen35Cache<B>,device: &B::Device) -> Result<Qwen35Cache<B>,RecorderError> {
-        if self.version != 1 || model_id.is_empty() || self.model_id != model_id || self.layers.len() != template.layers.len()
+    pub fn restore(mut self,model_id: &str,template: &Qwen35Cache<B>,device: &B::Device) -> Result<Qwen35Cache<B>,RecorderError> {
+        let rotary_length = match self.version {
+            1 if template.rotary_length == 0 => 0,
+            2 => match self.layers.pop() {
+                Some(Qwen35LayerCacheState::Rotary {cached_length})
+                    if template.rotary_length > 0 && cached_length >= template.rotary_length => cached_length,
+                _ => return Err(invalid("dynamic rotary continuation is missing or differs from the model")),
+            },
+            _ => return Err(invalid("record version or rotary policy differs")),
+        };
+        if model_id.is_empty() || self.model_id != model_id || self.layers.len() != template.layers.len()
             || self.layers.is_empty() || template.position != 0 || template.batch.is_some() {
             return Err(invalid("record version, exact model identity or fresh layer layout differs"));
         }
@@ -125,8 +139,9 @@ impl<B: Backend> Qwen35CacheRecord<B> {
                 convolution:convolution.map(|data| {let dtype = data.dtype;Tensor::from_data(data,(device,dtype))}),
                 state:state.map(|data| {let dtype = data.dtype;Tensor::from_data(data,(device,dtype))}),
             },
+            Qwen35LayerCacheState::Rotary {..} => unreachable!("rotary metadata was removed before layer validation"),
         }).collect();
-        Ok(Qwen35Cache {layers,position:self.position,batch:self.batch})
+        Ok(Qwen35Cache {layers,position:self.position,batch:self.batch,rotary_length})
     }
 }
 

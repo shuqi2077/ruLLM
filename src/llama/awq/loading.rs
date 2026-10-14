@@ -117,6 +117,7 @@ where
     pub(crate) fn load_checkpoint(
         checkpoint: &AwqCheckpoint,
         config: &LlamaConfig,
+        rotary: &crate::llama::rope::RopeParameters,
         qwen2: bool,
         tied_embeddings: bool,
         device: &R::Device,
@@ -136,13 +137,7 @@ where
                 device,
             )?),
         };
-        let rope = if qwen2 {
-            crate::llama::rope::qwen2_rope_with_dtype::<AwqBackend<R>>(config, device, DType::F16)
-        } else {
-            RotaryEncodingConfig::new(config.max_sequence_length, config.head_dimension())
-                .with_theta(config.rope_theta)
-                .init(device)
-        };
+        let tables = rotary.tables::<AwqBackend<R>>(config, device, DType::F16);
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         let kv_dimension = config.num_kv_heads * config.head_dimension();
         for layer in 0..config.num_hidden_layers {
@@ -176,12 +171,9 @@ where
                     false,
                     device,
                 )?,
-                rope: rope.clone(),
-                rotary_layout: if qwen2 {
-                    RotaryLayout::HalfSplit
-                } else {
-                    RotaryLayout::Interleaved
-                },
+                rope: tables[layer].clone(),
+                rotary_state: rotary.for_layer(layer).runtime_state(),
+                rotary_layout: RotaryLayout::HalfSplit,
                 num_query_heads: config.num_query_heads,
                 num_kv_heads: config.num_kv_heads,
                 head_dimension: config.head_dimension(),

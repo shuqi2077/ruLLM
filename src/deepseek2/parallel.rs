@@ -1,6 +1,6 @@
 use super::{
     DeepseekV2AttentionMode, DeepseekV2Cache, DeepseekV2CacheRecord, DeepseekV2Config,
-    DeepseekV2Model, ExpertShard, load_rank,
+    DeepseekV2Model, ExpertShard, load_rank_with, MlaFp8Backend, weights,
 };
 use crate::{
     CausalModel, GenerationCacheContinuation, GenerationError, HuggingFaceLoadError,
@@ -11,6 +11,9 @@ use ruda_tensor::api::{Int, Tensor, TensorPrimitive};
 use ruda_tensor::device::Device;
 use ruda_tensor::distributed::{DistributedBackend, ReduceOperation};
 use std::{path::Path, sync::Arc};
+use crate::{DeviceBatchModel,PrefixBatchModel};
+crate::parallel_batch::parallel_batch_model!(DeepseekV2ExpertParallel,DeepseekV2Model);
+crate::parallel_batch::parallel_speculative_model!(DeepseekV2ExpertParallel,DeepseekV2Model);
 
 pub struct DeepseekV2ExpertParallel<B: DistributedBackend> {
     pub config: DeepseekV2Config,
@@ -29,12 +32,23 @@ pub struct LoadedDeepseekV2ExpertParallel<B: DistributedBackend> {
     pub model: DeepseekV2ExpertParallel<B>,
     pub eos_token_ids: Vec<i32>,
     pub reports: Vec<HuggingFaceLoadReport>,
+    pub auxiliary_tensors: Vec<Vec<String>>,
 }
 
 pub fn load_huggingface_deepseek_v2_expert_parallel<B: DistributedBackend>(
     directory: impl AsRef<Path>,
     devices: Vec<B::Device>,
 ) -> Result<LoadedDeepseekV2ExpertParallel<B>, HuggingFaceLoadError> {
+    load_parallel(directory.as_ref(), devices, None)
+}
+
+pub fn load_huggingface_mla_expert_parallel<B: DistributedBackend + MlaFp8Backend>(directory: impl AsRef<Path>, devices: Vec<B::Device>)
+    -> Result<LoadedDeepseekV2ExpertParallel<B>, HuggingFaceLoadError> {
+    load_parallel(directory.as_ref(), devices, Some(weights::native_projection::<B>))
+}
+
+fn load_parallel<B: DistributedBackend>(directory: &Path, devices: Vec<B::Device>, packed: Option<weights::Loader<B>>)
+    -> Result<LoadedDeepseekV2ExpertParallel<B>, HuggingFaceLoadError> {
     let ids = devices.iter().map(Device::to_id).collect::<Vec<_>>();
     if devices.is_empty() || ids.iter().enumerate().any(|(i, id)| ids[..i].contains(id)) {
         return Err(HuggingFaceLoadError(
@@ -42,7 +56,7 @@ pub fn load_huggingface_deepseek_v2_expert_parallel<B: DistributedBackend>(
         ));
     }
     let config: DeepseekV2Config = serde_json::from_slice(
-        &std::fs::read(directory.as_ref().join("config.json"))
+        &std::fs::read(directory.join("config.json"))
             .map_err(|e| HuggingFaceLoadError(e.to_string()))?,
     )
     .map_err(|e| HuggingFaceLoadError(e.to_string()))?;
@@ -54,6 +68,7 @@ pub fn load_huggingface_deepseek_v2_expert_parallel<B: DistributedBackend>(
     }
     let mut ranks = Vec::with_capacity(devices.len());
     let mut reports = Vec::with_capacity(devices.len());
+    let mut auxiliary_tensors = Vec::with_capacity(devices.len());
     let mut eos_token_ids = None;
     for (rank, device) in devices.iter().enumerate() {
         let group = ids.clone();
@@ -67,7 +82,7 @@ pub fn load_huggingface_deepseek_v2_expert_parallel<B: DistributedBackend>(
                 .resolve(),
             ))
         });
-        let loaded = load_rank(
+        let loaded = load_rank_with(
             directory.as_ref(),
             device,
             Some(ExpertShard {
@@ -75,6 +90,7 @@ pub fn load_huggingface_deepseek_v2_expert_parallel<B: DistributedBackend>(
                 world: devices.len(),
             }),
             Some(reduce),
+            packed,
         )?;
         if eos_token_ids
             .as_ref()
@@ -87,6 +103,7 @@ pub fn load_huggingface_deepseek_v2_expert_parallel<B: DistributedBackend>(
         eos_token_ids = Some(loaded.eos_token_ids);
         ranks.push(loaded.model);
         reports.push(loaded.report);
+        auxiliary_tensors.push(loaded.auxiliary_tensors);
     }
     Ok(LoadedDeepseekV2ExpertParallel {
         model: DeepseekV2ExpertParallel {
@@ -96,6 +113,7 @@ pub fn load_huggingface_deepseek_v2_expert_parallel<B: DistributedBackend>(
         },
         eos_token_ids: eos_token_ids.unwrap_or_default(),
         reports,
+        auxiliary_tensors,
     })
 }
 

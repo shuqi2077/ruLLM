@@ -8,13 +8,27 @@ use crate::{
 };
 use ruda_tensor::api::{
     DType, IndexingUpdateOp, Int, Tensor, TensorData,
-    activation::{silu, softmax},
+    activation::{sigmoid, silu, softmax},
     backend::Backend,
 };
 use serde::Deserialize;
 use std::{collections::BTreeSet, path::Path, sync::Arc};
 
 mod cache;
+mod batching;
+mod routing;
+mod feed_forward;
+mod kimi_linear;
+pub use kimi_linear::*;
+mod weights;
+mod mtp;
+pub use mtp::{DeepseekMtp, DeepseekMtpCache, DeepseekMtpGenerationCache, DeepseekMtpGenerationCacheRecord, DeepseekMtpOutput, LoadedDeepseekMtp,
+    load_huggingface_deepseek_mtp, load_huggingface_mla_mtp};
+pub use mtp::{DeepseekMtpBatchCache,DeepseekMtpBatchPrefix};
+#[cfg(feature="tensor-parallel")]
+pub use mtp::parallel::{DeepseekMtpExpertParallel,DeepseekMtpExpertParallelCache,DeepseekMtpExpertParallelCacheRecord,
+    LoadedDeepseekMtpExpertParallel,load_huggingface_deepseek_mtp_expert_parallel,load_huggingface_mla_mtp_expert_parallel};
+pub use weights::{MlaFp8Backend, MlaFp8Projection, load_huggingface_mla};
 pub use cache::{DeepseekV2Cache, DeepseekV2CacheRecord};
 #[cfg(feature = "tensor-parallel")]
 pub mod parallel;
@@ -53,6 +67,7 @@ pub struct DeepseekV2Config {
     pub attention_bias: bool,
     pub attention_dropout: f64,
     pub tie_word_embeddings: bool,
+    #[serde(default = "one")]
     pub pretraining_tp: usize,
     pub eos_token_id: Option<serde_json::Value>,
     #[serde(default)]
@@ -61,7 +76,7 @@ pub struct DeepseekV2Config {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct DeepseekV2Yarn {
-    #[serde(rename = "type")]
+    #[serde(rename = "type", alias = "rope_type")]
     pub kind: String,
     pub factor: f64,
     pub original_max_position_embeddings: usize,
@@ -79,7 +94,7 @@ impl DeepseekV2Config {
         }
     }
     fn validate(&self) -> Result<(), HuggingFaceLoadError> {
-        if self.model_type != "deepseek_v2"
+        if !matches!(self.model_type.as_str(), "deepseek_v2" | "deepseek_v3" | "kimi_k2")
             || [
                 self.vocab_size,
                 self.hidden_size,
@@ -105,10 +120,7 @@ impl DeepseekV2Config {
             || self.num_key_value_heads != self.num_attention_heads
             || !self.qk_rope_head_dim.is_multiple_of(2)
             || self.hidden_act != "silu"
-            || self.scoring_func != "softmax"
-            || self.topk_method != "greedy"
-            || self.n_group != 1
-            || self.topk_group != 1
+            || !routing::valid(self)
             || self.pretraining_tp != 1
             || self.attention_dropout != 0.0
             || self.tie_word_embeddings
@@ -118,10 +130,7 @@ impl DeepseekV2Config {
             || self.rope_theta <= 1.0
             || !self.routed_scaling_factor.is_finite()
             || self.routed_scaling_factor <= 0.0
-            || self
-                .quantization_config
-                .as_ref()
-                .is_some_and(|v| !v.is_null())
+            || weights::block_config(self.quantization_config.as_ref()).is_err()
             || self.rope_scaling.as_ref().is_some_and(|s| {
                 s.kind != "yarn"
                     || !s.factor.is_finite()
@@ -137,7 +146,7 @@ impl DeepseekV2Config {
                     || s.mscale_all_dim < 0.0
             })
         {
-            return Err(HuggingFaceLoadError("requires floating DeepSeek-V2 MLA, SiLU, greedy softmax routing, and unscaled/YaRN RoPE".into()));
+            return Err(HuggingFaceLoadError("incompatible DeepSeek/Kimi MLA geometry, routing, quantization or RoPE configuration".into()));
         }
         self.qk_nope_head_dim
             .checked_add(self.qk_rope_head_dim)
@@ -149,17 +158,30 @@ impl DeepseekV2Config {
     }
 }
 
-struct Projection<B: Backend> {
-    weight: Tensor<B, 2>,
-    bias: Option<Tensor<B, 1>>,
+fn one() -> usize { 1 }
+
+enum Projection<B: Backend> {
+    Dense { weight: Tensor<B, 2>, bias: Option<Tensor<B, 1>> },
+    Packed { forward: Arc<dyn Fn(Tensor<B, 3>) -> Tensor<B, 3> + Send + Sync>,
+        materialize: Arc<dyn Fn() -> Tensor<B, 2> + Send + Sync>, dtype: DType },
 }
 impl<B: Backend> Projection<B> {
     fn forward(&self, input: Tensor<B, 3>) -> Tensor<B, 3> {
-        let output = input.matmul(self.weight.clone().transpose().unsqueeze::<3>());
-        match &self.bias {
+        let Self::Dense { weight, bias } = self else {
+            let Self::Packed { forward, .. } = self else { unreachable!() };
+            return forward(input);
+        };
+        let output = input.matmul(weight.clone().transpose().unsqueeze::<3>());
+        match bias {
             Some(bias) => output + bias.clone().unsqueeze::<3>(),
             None => output,
         }
+    }
+    fn weight(&self) -> Tensor<B, 2> {
+        match self { Self::Dense { weight, .. } => weight.clone(), Self::Packed { materialize, .. } => materialize() }
+    }
+    fn dtype(&self) -> DType {
+        match self { Self::Dense { weight, .. } => weight.dtype(), Self::Packed { dtype, .. } => *dtype }
     }
 }
 struct Mlp<B: Backend> {
@@ -177,6 +199,7 @@ enum FeedForward<B: Backend> {
     Dense(Mlp<B>),
     Experts {
         router: Tensor<B, 2>,
+        correction: Option<Tensor<B, 1>>,
         experts: Vec<(usize, Mlp<B>)>,
         shared: Option<Mlp<B>>,
     },
@@ -186,7 +209,7 @@ struct Layer<B: Backend> {
     q_a: Option<(Projection<B>, Tensor<B, 1>)>,
     kv_a: Projection<B>,
     kv_norm: Tensor<B, 1>,
-    kv_b: Tensor<B, 2>,
+    kv_b: Projection<B>,
     o: Projection<B>,
     input_norm: Tensor<B, 1>,
     post_norm: Tensor<B, 1>,
@@ -212,6 +235,7 @@ pub struct LoadedDeepseekV2<B: Backend> {
     pub model: DeepseekV2Model<B>,
     pub eos_token_ids: Vec<i32>,
     pub report: HuggingFaceLoadReport,
+    pub auxiliary_tensors: Vec<String>,
 }
 
 fn norm<B: Backend, const D: usize>(
@@ -310,103 +334,168 @@ impl<B: Backend> DeepseekV2Model<B> {
         )
     }
 
-    fn feed_forward(
-        &self,
-        layer: &Layer<B>,
-        input: Tensor<B, 3>,
-    ) -> Result<Tensor<B, 3>, GenerationError> {
-        let FeedForward::Experts {
-            router,
-            experts,
-            shared,
-        } = &layer.mlp
-        else {
-            let FeedForward::Dense(mlp) = &layer.mlp else {
-                unreachable!()
-            };
-            return Ok(mlp.forward(input));
-        };
-        let [_, sequence, hidden] = input.dims();
-        let device = input.device();
-        let dtype = input.dtype();
-        let c = &self.config;
-        let flat = input.clone().reshape([sequence, hidden]);
-        let logits = flat
-            .clone()
-            .cast(DType::F32)
-            .matmul(router.clone().cast(DType::F32).transpose());
-        let (mut weights, indices) = softmax(logits, 1).topk_with_indices(c.num_experts_per_tok, 1);
-        if c.num_experts_per_tok > 1 && c.norm_topk_prob {
-            weights = weights.clone() / (weights.sum_dim(1) + 1e-20);
-        } else {
-            weights = weights * c.routed_scaling_factor;
-        }
-        let ids = indices
-            .try_into_data()
-            .map_err(|e| GenerationError(e.to_string()))?
-            .iter::<i32>()
-            .collect::<Vec<_>>();
-        if ids.len() != sequence * c.num_experts_per_tok
-            || ids
-                .iter()
-                .any(|&id| id < 0 || id as usize >= c.n_routed_experts)
-        {
-            return Err(GenerationError(
-                "DeepSeek router returned invalid expert assignments".into(),
-            ));
-        }
-        let weights = weights.reshape([sequence * c.num_experts_per_tok, 1]);
-        let mut routed = Tensor::<B, 2>::zeros([sequence, hidden], (&device, DType::F32));
-        for (expert_id, expert) in experts {
-            let assignments = ids
-                .iter()
-                .enumerate()
-                .filter(|(_, id)| **id as usize == *expert_id)
-                .map(|(slot, _)| slot)
-                .collect::<Vec<_>>();
-            if assignments.is_empty() {
-                continue;
-            }
-            let rows = assignments
-                .iter()
-                .map(|&slot| (slot / c.num_experts_per_tok) as i32)
-                .collect::<Vec<_>>();
-            let slots = assignments
-                .iter()
-                .map(|&slot| i32::try_from(slot).map_err(|e| GenerationError(e.to_string())))
-                .collect::<Result<Vec<_>, _>>()?;
-            let count = rows.len();
-            let rows = Tensor::<B, 1, Int>::from_data(TensorData::new(rows, [count]), &device);
-            let slots = Tensor::<B, 1, Int>::from_data(TensorData::new(slots, [count]), &device);
-            let selected = flat
-                .clone()
-                .select(0, rows.clone())
-                .reshape([1, count, hidden]);
-            let output = expert
-                .forward(selected)
-                .reshape([count, hidden])
-                .cast(DType::F32)
-                * weights.clone().select(0, slots);
-            routed = routed.select_assign(0, rows, output, IndexingUpdateOp::Add);
-        }
-        let routed = routed.reshape([1, sequence, hidden]);
-        let routed = match &self.reduction {
-            Some(reduce) => reduce(routed),
-            None => routed,
-        };
-        let mut routed = routed.cast(dtype);
-        if let Some(shared) = shared {
-            routed = routed + shared.forward(input);
-        }
-        Ok(routed)
+    fn feed_forward(&self, layer: &Layer<B>, input: Tensor<B, 3>) -> Result<Tensor<B, 3>, GenerationError> {
+        layer.mlp.run(input, &self.config, self.reduction.as_ref())
     }
 
-    fn forward_block(
+    fn layer_forward(&self, layer: &Layer<B>, mut hidden: Tensor<B, 3>, state: &mut cache::LayerCache<B>,
+        start: usize, cos: Tensor<B, 4>, sin: Tensor<B, 4>, scale: f64) -> Result<Tensor<B, 3>, GenerationError> {
+        let c = &self.config;
+        let sequence = hidden.dims()[1];
+        let end = start + sequence;
+        let width = c.kv_lora_rank + c.qk_rope_head_dim;
+        let dtype = hidden.dtype();
+        let device = hidden.device();
+        let input = norm(hidden.clone(), &layer.input_norm, c.rms_norm_eps);
+        let q_input = match &layer.q_a {
+            Some((project, weight)) => norm(project.forward(input.clone()), weight, 1e-6),
+            None => input.clone(),
+        };
+        let query = layer
+            .q
+            .forward(q_input)
+            .reshape([
+                1,
+                sequence,
+                c.num_attention_heads,
+                c.qk_nope_head_dim + c.qk_rope_head_dim,
+            ])
+            .swap_dims(1, 2);
+        let content_query = query.clone().slice([
+            0..1,
+            0..c.num_attention_heads,
+            0..sequence,
+            0..c.qk_nope_head_dim,
+        ]);
+        let position_query = rotate(
+            query.slice([
+                0..1,
+                0..c.num_attention_heads,
+                0..sequence,
+                c.qk_nope_head_dim..c.qk_nope_head_dim + c.qk_rope_head_dim,
+            ]),
+            cos.clone(),
+            sin.clone(),
+        );
+        let compressed = layer.kv_a.forward(input);
+        let latent = norm(
+            compressed
+                .clone()
+                .slice([0..1, 0..sequence, 0..c.kv_lora_rank]),
+            &layer.kv_norm,
+            1e-6,
+        )
+        .reshape([1, 1, sequence, c.kv_lora_rank]);
+        let position = rotate(
+            compressed
+                .slice([0..1, 0..sequence, c.kv_lora_rank..width])
+                .reshape([1, 1, sequence, c.qk_rope_head_dim]),
+            cos.clone(),
+            sin.clone(),
+        );
+        let history = state.append(
+            Tensor::cat(vec![latent, position], 3),
+            c.max_position_embeddings,
+        )?;
+        let latent = history
+            .clone()
+            .slice([0..1, 0..1, 0..end, 0..c.kv_lora_rank]);
+        let position = history.slice([0..1, 0..1, 0..end, c.kv_lora_rank..width]);
+        let (mut scores, values, value_weights) = match self.attention_mode {
+            DeepseekV2AttentionMode::Absorbed => {
+                let weights = layer.kv_b.weight().reshape([1, c.num_attention_heads,
+                    c.qk_nope_head_dim + c.v_head_dim, c.kv_lora_rank]);
+                let key_weights = weights.clone().slice([0..1, 0..c.num_attention_heads,
+                    0..c.qk_nope_head_dim, 0..c.kv_lora_rank]);
+                let value_weights = weights.slice([0..1, 0..c.num_attention_heads,
+                    c.qk_nope_head_dim..c.qk_nope_head_dim + c.v_head_dim, 0..c.kv_lora_rank]).swap_dims(2, 3);
+                let query = mla_absorb_query(&ops(), content_query, key_weights);
+                (
+                    mla_scores(&ops(), query, position_query, latent.clone(), position),
+                    None,
+                    Some(value_weights),
+                )
+            }
+            DeepseekV2AttentionMode::Expanded => {
+                let expanded = layer.kv_b.forward(latent.clone().reshape([1, end, c.kv_lora_rank]))
+                    .reshape([
+                        1,
+                        end,
+                        c.num_attention_heads,
+                        c.qk_nope_head_dim + c.v_head_dim,
+                    ])
+                    .swap_dims(1, 2);
+                let content_key = expanded.clone().slice([
+                    0..1,
+                    0..c.num_attention_heads,
+                    0..end,
+                    0..c.qk_nope_head_dim,
+                ]);
+                let value = expanded.slice([
+                    0..1,
+                    0..c.num_attention_heads,
+                    0..end,
+                    c.qk_nope_head_dim..c.qk_nope_head_dim + c.v_head_dim,
+                ]);
+                let query = Tensor::cat(vec![content_query, position_query], 3);
+                let key = Tensor::cat(
+                    vec![content_key, position.repeat_dim(1, c.num_attention_heads)],
+                    3,
+                );
+                (gqa_scores(&ops(), query, key), Some(value), None)
+            }
+        };
+        scores = scores * scale;
+        if sequence > 1 {
+            let mask = (0..sequence)
+                .flat_map(|i| {
+                    (0..end).map(move |j| {
+                        if j <= start + i {
+                            0.0f32
+                        } else {
+                            f32::NEG_INFINITY
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+            scores = scores
+                + Tensor::<B, 4>::from_data(
+                    TensorData::new(mask, [1, 1, sequence, end]),
+                    (&device, dtype),
+                );
+        }
+        let probabilities = softmax(scores.cast(DType::F32), 3).cast(dtype);
+        let context = match values {
+            Some(values) => probabilities.matmul(values),
+            None => mla_value_product(&ops(), probabilities, latent, value_weights.expect("absorbed value weights")),
+        };
+        hidden = hidden
+            + layer.o.forward(context.swap_dims(1, 2).reshape([
+                1,
+                sequence,
+                c.num_attention_heads * c.v_head_dim,
+            ]));
+        let input = norm(hidden.clone(), &layer.post_norm, c.rms_norm_eps);
+        hidden = hidden + self.feed_forward(layer, input)?;
+        Ok(hidden)
+    }
+
+    fn forward_block(&self, tokens: Tensor<B, 2, Int>, cache: &mut DeepseekV2Cache<B>, last_only: bool)
+        -> Result<Tensor<B, 3>, GenerationError> {
+        self.forward_features(tokens, cache, last_only).map(|(logits, _)| logits)
+    }
+
+    pub fn forward_features(
         &self,
         tokens: Tensor<B, 2, Int>,
         cache: &mut DeepseekV2Cache<B>,
         last_only: bool,
-    ) -> Result<Tensor<B, 3>, GenerationError> {
+    ) -> Result<(Tensor<B, 3>, Tensor<B, 3>), GenerationError> {
+        self.forward_features_impl(tokens,cache,last_only,false)
+    }
+
+    fn forward_features_impl(&self,tokens:Tensor<B,2,Int>,cache:&mut DeepseekV2Cache<B>,last_only:bool,retain_all_hidden:bool)
+        ->Result<(Tensor<B,3>,Tensor<B,3>),GenerationError> {
         let [batch, sequence] = tokens.dims();
         let c = &self.config;
         let start = cache.position();
@@ -439,159 +528,15 @@ impl<B: Backend> DeepseekV2Model<B> {
         let (cos, sin, scale) = self.rotary(start, sequence, dtype, &device);
         let end = start + sequence;
         for (layer, state) in self.layers.iter().zip(&mut cache.layers) {
-            let input = norm(hidden.clone(), &layer.input_norm, c.rms_norm_eps);
-            let q_input = match &layer.q_a {
-                Some((project, weight)) => norm(project.forward(input.clone()), weight, 1e-6),
-                None => input.clone(),
-            };
-            let query = layer
-                .q
-                .forward(q_input)
-                .reshape([
-                    1,
-                    sequence,
-                    c.num_attention_heads,
-                    c.qk_nope_head_dim + c.qk_rope_head_dim,
-                ])
-                .swap_dims(1, 2);
-            let content_query = query.clone().slice([
-                0..1,
-                0..c.num_attention_heads,
-                0..sequence,
-                0..c.qk_nope_head_dim,
-            ]);
-            let position_query = rotate(
-                query.slice([
-                    0..1,
-                    0..c.num_attention_heads,
-                    0..sequence,
-                    c.qk_nope_head_dim..c.qk_nope_head_dim + c.qk_rope_head_dim,
-                ]),
-                cos.clone(),
-                sin.clone(),
-            );
-            let compressed = layer.kv_a.forward(input);
-            let latent = norm(
-                compressed
-                    .clone()
-                    .slice([0..1, 0..sequence, 0..c.kv_lora_rank]),
-                &layer.kv_norm,
-                1e-6,
-            )
-            .reshape([1, 1, sequence, c.kv_lora_rank]);
-            let position = rotate(
-                compressed
-                    .slice([0..1, 0..sequence, c.kv_lora_rank..width])
-                    .reshape([1, 1, sequence, c.qk_rope_head_dim]),
-                cos.clone(),
-                sin.clone(),
-            );
-            let history = state.append(
-                Tensor::cat(vec![latent, position], 3),
-                c.max_position_embeddings,
-            )?;
-            let latent = history
-                .clone()
-                .slice([0..1, 0..1, 0..end, 0..c.kv_lora_rank]);
-            let position = history.slice([0..1, 0..1, 0..end, c.kv_lora_rank..width]);
-            let expanded_weights = layer.kv_b.clone().reshape([
-                1,
-                c.num_attention_heads,
-                c.qk_nope_head_dim + c.v_head_dim,
-                c.kv_lora_rank,
-            ]);
-            let key_weights = expanded_weights.clone().slice([
-                0..1,
-                0..c.num_attention_heads,
-                0..c.qk_nope_head_dim,
-                0..c.kv_lora_rank,
-            ]);
-            let value_weights = expanded_weights
-                .slice([
-                    0..1,
-                    0..c.num_attention_heads,
-                    c.qk_nope_head_dim..c.qk_nope_head_dim + c.v_head_dim,
-                    0..c.kv_lora_rank,
-                ])
-                .swap_dims(2, 3);
-            let (mut scores, values) = match self.attention_mode {
-                DeepseekV2AttentionMode::Absorbed => {
-                    let query = mla_absorb_query(&ops(), content_query, key_weights);
-                    (
-                        mla_scores(&ops(), query, position_query, latent.clone(), position),
-                        None,
-                    )
-                }
-                DeepseekV2AttentionMode::Expanded => {
-                    let expanded = latent
-                        .clone()
-                        .reshape([1, end, c.kv_lora_rank])
-                        .matmul(layer.kv_b.clone().transpose().unsqueeze::<3>())
-                        .reshape([
-                            1,
-                            end,
-                            c.num_attention_heads,
-                            c.qk_nope_head_dim + c.v_head_dim,
-                        ])
-                        .swap_dims(1, 2);
-                    let content_key = expanded.clone().slice([
-                        0..1,
-                        0..c.num_attention_heads,
-                        0..end,
-                        0..c.qk_nope_head_dim,
-                    ]);
-                    let value = expanded.slice([
-                        0..1,
-                        0..c.num_attention_heads,
-                        0..end,
-                        c.qk_nope_head_dim..c.qk_nope_head_dim + c.v_head_dim,
-                    ]);
-                    let query = Tensor::cat(vec![content_query, position_query], 3);
-                    let key = Tensor::cat(
-                        vec![content_key, position.repeat_dim(1, c.num_attention_heads)],
-                        3,
-                    );
-                    (gqa_scores(&ops(), query, key), Some(value))
-                }
-            };
-            scores = scores * scale;
-            if sequence > 1 {
-                let mask = (0..sequence)
-                    .flat_map(|i| {
-                        (0..end).map(move |j| {
-                            if j <= start + i {
-                                0.0f32
-                            } else {
-                                f32::NEG_INFINITY
-                            }
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                scores = scores
-                    + Tensor::<B, 4>::from_data(
-                        TensorData::new(mask, [1, 1, sequence, end]),
-                        (&device, dtype),
-                    );
-            }
-            let probabilities = softmax(scores.cast(DType::F32), 3).cast(dtype);
-            let context = match values {
-                Some(values) => probabilities.matmul(values),
-                None => mla_value_product(&ops(), probabilities, latent, value_weights),
-            };
-            hidden = hidden
-                + layer.o.forward(context.swap_dims(1, 2).reshape([
-                    1,
-                    sequence,
-                    c.num_attention_heads * c.v_head_dim,
-                ]));
-            let input = norm(hidden.clone(), &layer.post_norm, c.rms_norm_eps);
-            hidden = hidden + self.feed_forward(layer, input)?;
+            hidden = self.layer_forward(layer, hidden, state, start, cos.clone(), sin.clone(), scale)?;
         }
         cache.position = end;
-        if last_only {
+        if last_only && !retain_all_hidden {
             hidden = hidden.slice([0..1, sequence - 1..sequence, 0..c.hidden_size]);
         }
-        Ok(self.head.forward(norm(hidden, &self.norm, c.rms_norm_eps)))
+        let normalized = norm(hidden, &self.norm, c.rms_norm_eps);
+        let selected=if last_only && retain_all_hidden {normalized.clone().slice([0..1,sequence-1..sequence,0..c.hidden_size])} else {normalized.clone()};
+        Ok((self.head.forward(selected), normalized))
     }
 }
 
@@ -634,7 +579,7 @@ impl<B: Backend> SpeculativeModel<B> for DeepseekV2Model<B> {
 }
 
 fn projection<B: Backend>(
-    checkpoint: &mut Checkpoint,
+    checkpoint: &mut weights::Weights<B>,
     prefix: &str,
     input: usize,
     output: usize,
@@ -642,6 +587,7 @@ fn projection<B: Backend>(
     device: &B::Device,
     dtype: DType,
 ) -> Result<Projection<B>, HuggingFaceLoadError> {
+    if checkpoint.is_fp8(prefix) { return checkpoint.packed_projection(prefix, input, output, bias, device, dtype); }
     let weight = checkpoint.tensor(&format!("{prefix}.weight"), [output, input], device)?;
     let bias = if bias {
         Some(checkpoint.tensor(&format!("{prefix}.bias"), [output], device)?)
@@ -653,10 +599,10 @@ fn projection<B: Backend>(
             "mixed storage dtype for {prefix}"
         )));
     }
-    Ok(Projection { weight, bias })
+    Ok(Projection::Dense { weight, bias })
 }
 fn load_mlp<B: Backend>(
-    checkpoint: &mut Checkpoint,
+    checkpoint: &mut weights::Weights<B>,
     prefix: &str,
     hidden: usize,
     intermediate: usize,
@@ -712,14 +658,203 @@ fn load_rank<B: Backend>(
     shard: Option<ExpertShard>,
     reduction: Option<Arc<dyn Fn(Tensor<B, 3>) -> Tensor<B, 3> + Send + Sync>>,
 ) -> Result<LoadedDeepseekV2<B>, HuggingFaceLoadError> {
+    load_rank_with(directory, device, shard, reduction, None)
+}
+
+fn load_layer<B: Backend>(checkpoint: &mut weights::Weights<B>, config: &DeepseekV2Config,
+    i: usize, shard: Option<&ExpertShard>, excluded: &mut BTreeSet<String>, device: &B::Device, dtype: DType)
+    -> Result<Layer<B>, HuggingFaceLoadError> {
+    let p = format!("model.layers.{i}");
+    let attention = format!("{p}.self_attn");
+    let q_a = if let Some(rank) = config.q_lora_rank {
+        Some((
+            projection(
+                checkpoint,
+                &format!("{attention}.q_a_proj"),
+                config.hidden_size,
+                rank,
+                config.attention_bias,
+                device,
+                dtype,
+            )?,
+            checkpoint.tensor(&format!("{attention}.q_a_layernorm.weight"), [rank], device)?,
+        ))
+    } else {
+        None
+    };
+    let q = projection(
+        checkpoint,
+        &format!(
+            "{attention}.{}",
+            if q_a.is_some() { "q_b_proj" } else { "q_proj" }
+        ),
+        config.q_lora_rank.unwrap_or(config.hidden_size),
+        config.num_attention_heads * (config.qk_nope_head_dim + config.qk_rope_head_dim),
+        false,
+        device,
+        dtype,
+    )?;
+    let kv_a = projection(
+        checkpoint,
+        &format!("{attention}.kv_a_proj_with_mqa"),
+        config.hidden_size,
+        config.kv_lora_rank + config.qk_rope_head_dim,
+        config.attention_bias,
+        device,
+        dtype,
+    )?;
+    let kv_norm = checkpoint.tensor(
+        &format!("{attention}.kv_a_layernorm.weight"),
+        [config.kv_lora_rank],
+        device,
+    )?;
+    let kv_b = projection(checkpoint, &format!("{attention}.kv_b_proj"),
+        config.kv_lora_rank, config.num_attention_heads * (config.qk_nope_head_dim + config.v_head_dim),
+        false, device, dtype)?;
+    let o = projection(
+        checkpoint,
+        &format!("{attention}.o_proj"),
+        config.num_attention_heads * config.v_head_dim,
+        config.hidden_size,
+        config.attention_bias,
+        device,
+        dtype,
+    )?;
+    let mlp =
+        if i >= config.first_k_dense_replace && i % config.moe_layer_freq == 0 {
+            let router = checkpoint.tensor(
+                &format!("{p}.mlp.gate.weight"),
+                [config.n_routed_experts, config.hidden_size],
+                device,
+            )?;
+            let correction = if config.topk_method == "noaux_tc" {
+                Some(checkpoint.tensor(&format!("{p}.mlp.gate.e_score_correction_bias"),
+                    [config.n_routed_experts], device)?)
+            } else { None };
+            let mut experts = Vec::new();
+            for expert in 0..config.n_routed_experts {
+                let prefix = format!("{p}.mlp.experts.{expert}");
+                let owned = shard
+                    .as_ref()
+                    .is_none_or(|s| expert / (config.n_routed_experts / s.world) == s.rank);
+                if owned {
+                    experts.push((
+                        expert,
+                        load_mlp(
+                            checkpoint,
+                            &prefix,
+                            config.hidden_size,
+                            config.moe_intermediate_size,
+                            device,
+                            dtype,
+                        )?,
+                    ));
+                } else {
+                    for (projection, shape) in [
+                        (
+                            "gate_proj",
+                            [config.moe_intermediate_size, config.hidden_size],
+                        ),
+                        (
+                            "up_proj",
+                            [config.moe_intermediate_size, config.hidden_size],
+                        ),
+                        (
+                            "down_proj",
+                            [config.hidden_size, config.moe_intermediate_size],
+                        ),
+                    ] {
+                        checkpoint.exclude_projection(&format!("{prefix}.{projection}"), shape, dtype, excluded)?;
+                    }
+                }
+            }
+            let shared =
+                config
+                    .n_shared_experts
+                    .map(|count| {
+                        let intermediate =
+                            config.moe_intermediate_size.checked_mul(count).ok_or_else(
+                                || HuggingFaceLoadError("shared expert shape overflow".into()),
+                            )?;
+                        load_mlp(
+                            checkpoint,
+                            &format!("{p}.mlp.shared_experts"),
+                            config.hidden_size,
+                            intermediate,
+                            device,
+                            dtype,
+                        )
+                    })
+                    .transpose()?;
+            FeedForward::Experts {
+                router,
+                correction,
+                experts,
+                shared,
+            }
+        } else {
+            FeedForward::Dense(load_mlp(
+                checkpoint,
+                &format!("{p}.mlp"),
+                config.hidden_size,
+                config.intermediate_size,
+                device,
+                dtype,
+            )?)
+        };
+    let input_norm = checkpoint.tensor(
+        &format!("{p}.input_layernorm.weight"),
+        [config.hidden_size],
+        device,
+    )?;
+    let post_norm = checkpoint.tensor(
+        &format!("{p}.post_attention_layernorm.weight"),
+        [config.hidden_size],
+        device,
+    )?;
+    if [
+        kv_norm.dtype(),
+        kv_b.dtype(),
+        input_norm.dtype(),
+        post_norm.dtype(),
+    ]
+    .iter()
+    .any(|&d| d != dtype)
+        || q_a
+            .as_ref()
+            .is_some_and(|(_, weight)| weight.dtype() != dtype)
+        || matches!(&mlp, FeedForward::Experts {router, ..}
+            if router.dtype() != dtype && router.dtype() != DType::F32)
+    {
+        return Err(HuggingFaceLoadError(
+            "DeepSeek-V2 normalization/router storage dtypes differ".into(),
+        ));
+    }
+    Ok(Layer {
+        q,
+        q_a,
+        kv_a,
+        kv_norm,
+        kv_b,
+        o,
+        input_norm,
+        post_norm,
+        mlp,
+    })
+}
+
+fn load_rank_with<B: Backend>(directory: &Path, device: &B::Device, shard: Option<ExpertShard>,
+    reduction: Option<Arc<dyn Fn(Tensor<B, 3>) -> Tensor<B, 3> + Send + Sync>>,
+    packed: Option<weights::Loader<B>>) -> Result<LoadedDeepseekV2<B>, HuggingFaceLoadError> {
     let directory = directory
         .canonicalize()
         .map_err(|e| HuggingFaceLoadError(e.to_string()))?;
-    let config: DeepseekV2Config = serde_json::from_slice(
+    let source: serde_json::Value = serde_json::from_slice(
         &std::fs::read(directory.join("config.json"))
             .map_err(|e| HuggingFaceLoadError(e.to_string()))?,
     )
     .map_err(|e| HuggingFaceLoadError(e.to_string()))?;
+    let config: DeepseekV2Config = serde_json::from_value(source.clone()).map_err(|e| HuggingFaceLoadError(e.to_string()))?;
     config.validate()?;
     if shard.as_ref().is_some_and(|s| {
         s.world == 0 || s.rank >= s.world || !config.n_routed_experts.is_multiple_of(s.world)
@@ -728,7 +863,7 @@ fn load_rank<B: Backend>(
             "EP requires equal nonempty native expert shards".into(),
         ));
     }
-    let mut checkpoint = Checkpoint::open(&directory)?;
+    let mut checkpoint = weights::Weights::open(&directory, &config, packed)?;
     let embedding = checkpoint.tensor(
         "model.embed_tokens.weight",
         [config.vocab_size, config.hidden_size],
@@ -738,191 +873,7 @@ fn load_rank<B: Backend>(
     let mut excluded = BTreeSet::new();
     let mut layers = Vec::with_capacity(config.num_hidden_layers);
     for i in 0..config.num_hidden_layers {
-        let p = format!("model.layers.{i}");
-        let attention = format!("{p}.self_attn");
-        let q_a = if let Some(rank) = config.q_lora_rank {
-            Some((
-                projection(
-                    &mut checkpoint,
-                    &format!("{attention}.q_a_proj"),
-                    config.hidden_size,
-                    rank,
-                    config.attention_bias,
-                    device,
-                    dtype,
-                )?,
-                checkpoint.tensor(&format!("{attention}.q_a_layernorm.weight"), [rank], device)?,
-            ))
-        } else {
-            None
-        };
-        let q = projection(
-            &mut checkpoint,
-            &format!(
-                "{attention}.{}",
-                if q_a.is_some() { "q_b_proj" } else { "q_proj" }
-            ),
-            config.q_lora_rank.unwrap_or(config.hidden_size),
-            config.num_attention_heads * (config.qk_nope_head_dim + config.qk_rope_head_dim),
-            false,
-            device,
-            dtype,
-        )?;
-        let kv_a = projection(
-            &mut checkpoint,
-            &format!("{attention}.kv_a_proj_with_mqa"),
-            config.hidden_size,
-            config.kv_lora_rank + config.qk_rope_head_dim,
-            config.attention_bias,
-            device,
-            dtype,
-        )?;
-        let kv_norm = checkpoint.tensor(
-            &format!("{attention}.kv_a_layernorm.weight"),
-            [config.kv_lora_rank],
-            device,
-        )?;
-        let kv_b = checkpoint.tensor(
-            &format!("{attention}.kv_b_proj.weight"),
-            [
-                config.num_attention_heads * (config.qk_nope_head_dim + config.v_head_dim),
-                config.kv_lora_rank,
-            ],
-            device,
-        )?;
-        let o = projection(
-            &mut checkpoint,
-            &format!("{attention}.o_proj"),
-            config.num_attention_heads * config.v_head_dim,
-            config.hidden_size,
-            config.attention_bias,
-            device,
-            dtype,
-        )?;
-        let mlp =
-            if i >= config.first_k_dense_replace && i % config.moe_layer_freq == 0 {
-                let router = checkpoint.tensor(
-                    &format!("{p}.mlp.gate.weight"),
-                    [config.n_routed_experts, config.hidden_size],
-                    device,
-                )?;
-                let mut experts = Vec::new();
-                for expert in 0..config.n_routed_experts {
-                    let prefix = format!("{p}.mlp.experts.{expert}");
-                    let owned = shard
-                        .as_ref()
-                        .is_none_or(|s| expert / (config.n_routed_experts / s.world) == s.rank);
-                    if owned {
-                        experts.push((
-                            expert,
-                            load_mlp(
-                                &mut checkpoint,
-                                &prefix,
-                                config.hidden_size,
-                                config.moe_intermediate_size,
-                                device,
-                                dtype,
-                            )?,
-                        ));
-                    } else {
-                        for (projection, shape) in [
-                            (
-                                "gate_proj",
-                                [config.moe_intermediate_size, config.hidden_size],
-                            ),
-                            (
-                                "up_proj",
-                                [config.moe_intermediate_size, config.hidden_size],
-                            ),
-                            (
-                                "down_proj",
-                                [config.hidden_size, config.moe_intermediate_size],
-                            ),
-                        ] {
-                            let name = format!("{prefix}.{projection}.weight");
-                            let snapshot = checkpoint.tensors.get(&name).ok_or_else(|| {
-                                HuggingFaceLoadError(format!("missing expert tensor {name}"))
-                            })?;
-                            if snapshot.shape != shape.into() || snapshot.dtype != dtype {
-                                return Err(HuggingFaceLoadError(format!(
-                                    "incompatible remote expert tensor {name}"
-                                )));
-                            }
-                            excluded.insert(name);
-                        }
-                    }
-                }
-                let shared =
-                    config
-                        .n_shared_experts
-                        .map(|count| {
-                            let intermediate =
-                                config.moe_intermediate_size.checked_mul(count).ok_or_else(
-                                    || HuggingFaceLoadError("shared expert shape overflow".into()),
-                                )?;
-                            load_mlp(
-                                &mut checkpoint,
-                                &format!("{p}.mlp.shared_experts"),
-                                config.hidden_size,
-                                intermediate,
-                                device,
-                                dtype,
-                            )
-                        })
-                        .transpose()?;
-                FeedForward::Experts {
-                    router,
-                    experts,
-                    shared,
-                }
-            } else {
-                FeedForward::Dense(load_mlp(
-                    &mut checkpoint,
-                    &format!("{p}.mlp"),
-                    config.hidden_size,
-                    config.intermediate_size,
-                    device,
-                    dtype,
-                )?)
-            };
-        let input_norm = checkpoint.tensor(
-            &format!("{p}.input_layernorm.weight"),
-            [config.hidden_size],
-            device,
-        )?;
-        let post_norm = checkpoint.tensor(
-            &format!("{p}.post_attention_layernorm.weight"),
-            [config.hidden_size],
-            device,
-        )?;
-        if [
-            kv_norm.dtype(),
-            kv_b.dtype(),
-            input_norm.dtype(),
-            post_norm.dtype(),
-        ]
-        .iter()
-        .any(|&d| d != dtype)
-            || q_a
-                .as_ref()
-                .is_some_and(|(_, weight)| weight.dtype() != dtype)
-            || matches!(&mlp, FeedForward::Experts {router, ..} if router.dtype() != dtype)
-        {
-            return Err(HuggingFaceLoadError(
-                "DeepSeek-V2 normalization/router storage dtypes differ".into(),
-            ));
-        }
-        layers.push(Layer {
-            q,
-            q_a,
-            kv_a,
-            kv_norm,
-            kv_b,
-            o,
-            input_norm,
-            post_norm,
-            mlp,
-        });
+        layers.push(load_layer(&mut checkpoint, &config, i, shard.as_ref(), &mut excluded, device, dtype)?);
     }
     let norm = checkpoint.tensor("model.norm.weight", [config.hidden_size], device)?;
     if norm.dtype() != dtype {
@@ -939,10 +890,23 @@ fn load_rank<B: Backend>(
         device,
         dtype,
     )?;
+    let nextn = match source.get("num_nextn_predict_layers") {
+        None => 0,
+        Some(value) => value.as_u64().and_then(|n| usize::try_from(n).ok())
+            .ok_or_else(|| HuggingFaceLoadError("invalid num_nextn_predict_layers".into()))?,
+    };
+    let auxiliary_end = config.num_hidden_layers.checked_add(nextn)
+        .ok_or_else(|| HuggingFaceLoadError("MTP layer range overflow".into()))?;
+    let auxiliary_tensors = checkpoint.tensors.keys().filter(|name| {
+        name.strip_prefix("model.layers.").and_then(|rest| rest.split('.').next())
+            .and_then(|layer| layer.parse::<usize>().ok())
+            .is_some_and(|layer| (config.num_hidden_layers..auxiliary_end).contains(&layer))
+    }).cloned().collect::<Vec<_>>();
+    let auxiliary = auxiliary_tensors.iter().collect::<BTreeSet<_>>();
     let unused = checkpoint
         .tensors
         .keys()
-        .filter(|name| !checkpoint.consumed.contains(*name) && !excluded.contains(*name))
+        .filter(|name| !checkpoint.consumed.contains(*name) && !excluded.contains(*name) && !auxiliary.contains(name))
         .cloned()
         .collect::<Vec<_>>();
     if !unused.is_empty() {
@@ -987,7 +951,7 @@ fn load_rank<B: Backend>(
     B::sync(device).map_err(|e| HuggingFaceLoadError(e.to_string()))?;
     let report = HuggingFaceLoadReport {
         config_path: directory.join("config.json"),
-        weight_files: checkpoint.files,
+        weight_files: checkpoint.files.clone(),
         applied_tensors: checkpoint.consumed.len(),
         tied_word_embeddings: false,
     };
@@ -1003,5 +967,6 @@ fn load_rank<B: Backend>(
         },
         eos_token_ids,
         report,
+        auxiliary_tensors,
     })
 }

@@ -9,11 +9,14 @@ use std::fmt::{Display, Formatter};
 mod sampling;
 mod device;
 pub use device::{DeviceBatchModel, DeviceBatchExecutor, ExecutedBatch};
+mod prefix_device;
+pub use prefix_device::{PrefixBatchModel,PrefixBatchExecutor,PrefixBatchStep,ActiveKvSwapConfig,ActiveKvSwapStats};
 mod fenced;
 pub use fenced::{BatchFence, BatchLaunchFailure, FencedBatchScheduler};
 mod lifecycle;
 pub use lifecycle::{CancelledGeneration, ContinuousBatchOptions, KvAdmissionPolicy};
 pub(crate) use sampling::BatchTokenSelection;
+pub use sampling::BatchSamplingState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ContinuousBatchConfig {
@@ -188,12 +191,15 @@ pub struct ContinuousBatchScheduler {
     options: ContinuousBatchOptions,
     kv_cache: PagedKvCacheManager,
     pending: VecDeque<PendingRequest>,
+    deferred_prefill: BTreeSet<RequestId>,
     active: BTreeMap<RequestId, ActiveRequest>,
     finished: VecDeque<FinishedGeneration>,
     in_flight: Option<ScheduledBatch>,
     prefer_prefill: bool,
     next_request: u64,
     next_batch: u64,
+    prefill_chunk_tokens:Option<usize>,
+    admission_ceiling:Option<RequestId>,
 }
 
 impl ContinuousBatchScheduler {
@@ -217,12 +223,15 @@ impl ContinuousBatchScheduler {
             options,
             kv_cache: PagedKvCacheManager::new(kv_config)?,
             pending: VecDeque::new(),
+            deferred_prefill:BTreeSet::new(),
             active: BTreeMap::new(),
             finished: VecDeque::new(),
             in_flight: None,
             prefer_prefill: true,
             next_request: 1,
             next_batch: 1,
+            prefill_chunk_tokens:None,
+            admission_ceiling:None,
         })
     }
 
@@ -245,7 +254,7 @@ impl ContinuousBatchScheduler {
                 "continuous generation prompt must not be empty".into(),
             ));
         }
-        if prompt_token_ids.len() > self.config.max_batch_tokens {
+        if self.prefill_chunk_tokens.is_none() && prompt_token_ids.len() > self.config.max_batch_tokens {
             return Err(ContinuousBatchError(format!(
                 "prompt has {} tokens, above max_batch_tokens {}",
                 prompt_token_ids.len(),
@@ -378,8 +387,8 @@ impl ContinuousBatchScheduler {
             self.in_flight = Some(batch);
             return Err(error);
         }
-        let reservations = batch.sequences.iter().map(|row| row.reservation_id).collect::<Vec<_>>();
-        if let Err(error) = self.kv_cache.commit_appends(&reservations) {
+        let reservations = batch.sequences.iter().map(|row| (row.reservation_id,row.token_ids.len())).collect::<Vec<_>>();
+        if let Err(error) = self.kv_cache.commit_append_prefixes(&reservations) {
             self.in_flight = Some(batch);
             return Err(error.into());
         }
@@ -388,6 +397,10 @@ impl ContinuousBatchScheduler {
                 .active
                 .get_mut(&sequence.request_id)
                 .expect("batch ownership was validated before KV commit");
+            if sequence.context_length<request.prompt_token_ids.len() {
+                request.phase=RequestPhase::NeedsPrefill;
+                continue;
+            }
             request.generated_token_ids.push(token);
             let stopped_on_eos = request.eos.contains(&token);
             let finished = stopped_on_eos
@@ -457,6 +470,26 @@ impl ContinuousBatchScheduler {
         &self.kv_cache
     }
 
+    pub(super) fn reserve_lookahead(&mut self,batch:&ScheduledBatch,wanted:usize)
+        ->Result<BTreeMap<RequestId,PagedKvAppendReservation>,ContinuousBatchError> {
+        let mut reserved=BTreeMap::new();
+        if wanted==0 || batch.kind!=ScheduledBatchKind::Decode {return Ok(reserved);}
+        let mut budget=self.config.max_batch_tokens.saturating_sub(batch.batch_size());
+        let block=self.kv_cache.config().block_size;
+        for row in &batch.sequences {
+            let request=&self.active[&row.request_id];
+            let remaining=request.generation.max_new_tokens.saturating_sub(request.generated_token_ids.len());
+            let extra=wanted.min(budget).min(remaining.saturating_sub(1))
+                .min(self.kv_cache.config().max_sequence_length-row.context_length);
+            let pages=(row.context_length+extra).div_ceil(block).saturating_sub(row.block_table.len());
+            if extra>0 && pages<=self.kv_cache.free_page_count() {
+                let reservation=self.kv_cache.extend_append(row.reservation_id,extra)?;
+                budget-=extra;reserved.insert(row.request_id,reservation);
+            }
+        }
+        Ok(reserved)
+    }
+
     fn promote_pending(&mut self) -> Result<(), ContinuousBatchError> {
         let mut available_pages = self.kv_cache.config().num_pages;
         if self.options.kv_admission == KvAdmissionPolicy::ReserveSequenceCapacity {
@@ -467,19 +500,19 @@ impl ContinuousBatchScheduler {
             }
         }
         while self.active.len() < self.config.max_active_sequences {
+            let Some(position)=self.pending.iter().position(|r|!self.deferred_prefill.contains(&r.id)
+                && self.admission_ceiling.is_none_or(|ceiling|r.id<ceiling)) else {break;};
             if self.options.kv_admission == KvAdmissionPolicy::ReserveSequenceCapacity {
-                let Some(pending) = self.pending.front() else { break; };
+                let pending=&self.pending[position];
                 let pages = Self::request_page_budget(
                     pending.prompt_token_ids.len(), &pending.generation, self.kv_cache.config().block_size,
                 );
-                // FIFO admission prevents a stream of short arrivals from
+                // FIFO among ready requests prevents short arrivals from
                 // indefinitely overtaking an older, larger request.
                 if pages > available_pages { break; }
                 available_pages -= pages;
             }
-            let Some(pending) = self.pending.pop_front() else {
-                break;
-            };
+            let pending=self.pending.remove(position).expect("ready pending position");
             self.kv_cache.create_sequence(pending.id)?;
             self.active.insert(
                 pending.id,
@@ -526,27 +559,32 @@ impl ContinuousBatchScheduler {
     }
 
     fn schedule_prefill(&mut self) -> Result<Option<ScheduledBatch>, ContinuousBatchError> {
-        let mut buckets = BTreeMap::<usize, Vec<RequestId>>::new();
+        let mut buckets = BTreeMap::<(usize,bool), Vec<RequestId>>::new();
         for (&request_id, request) in &self.active {
+            let position=self.kv_cache.committed_tokens(request_id)?;
+            let remaining=request.prompt_token_ids.len().saturating_sub(position);
+            let next=remaining.min(self.prefill_chunk_tokens.unwrap_or(remaining)).min(self.config.max_batch_tokens);
             if request.phase == RequestPhase::NeedsPrefill
+                && !self.deferred_prefill.contains(&request_id)
+                && remaining>0
                 && self
                     .kv_cache
-                    .can_append(request_id, request.prompt_token_ids.len())?
+                    .can_append(request_id, next)?
             {
                 buckets
-                    .entry(request.prompt_token_ids.len())
+                    .entry((next,position!=0))
                     .or_default()
                     .push(request_id);
             }
         }
-        let Some((&next_n, candidates)) =
+        let Some((&(next_n,_), candidates)) =
             buckets
                 .iter()
                 .max_by(|(left_len, left), (right_len, right)| {
                     let left_tokens =
-                        left.len().min(self.config.max_batch_tokens / **left_len) * **left_len;
+                        left.len().min(self.config.max_batch_tokens / left_len.0) * left_len.0;
                     let right_tokens =
-                        right.len().min(self.config.max_batch_tokens / **right_len) * **right_len;
+                        right.len().min(self.config.max_batch_tokens / right_len.0) * right_len.0;
                     left_tokens
                         .cmp(&right_tokens)
                         // For equally full batches, keep the oldest request first.
@@ -564,12 +602,13 @@ impl ContinuousBatchScheduler {
             if !self.kv_cache.can_append(request_id, next_n)? {
                 continue;
             }
+            let position=self.kv_cache.committed_tokens(request_id)?;
             let prompt = self
                 .active
                 .get(&request_id)
                 .expect("prefill candidate came from the active request map")
                 .prompt_token_ids
-                .clone();
+                [position..position+next_n].to_vec();
             let reservation = match self.kv_cache.begin_append(request_id, next_n) {
                 Ok(reservation) => reservation,
                 Err(error) => {

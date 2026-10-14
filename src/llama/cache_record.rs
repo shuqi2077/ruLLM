@@ -1,6 +1,8 @@
 use super::{Backend,DType,LlamaKvCache,LlamaLayerCache,Tensor,TensorData};
 use crate::GenerationCacheContinuation;
 use ruda_model::record::{PrecisionSettings,Record,Recorder,RecorderError};
+use super::rope::RotaryHistory;
+use serde::{Deserialize,Deserializer,Serialize,Serializer,de::{Error,SeqAccess,Visitor},ser::SerializeTuple};
 use std::marker::PhantomData;
 
 /// Exact retained Llama KV history, original capacity limit and completed position.
@@ -11,14 +13,65 @@ pub struct LlamaKvCacheRecord<B: Backend> {
     position: usize,
     capacity: usize,
     layers: Vec<Option<(TensorData,TensorData)>>,
+    rotary: Vec<RotaryHistory>,
     backend: PhantomData<B>,
 }
 
+#[derive(Clone)]
+pub struct LlamaKvCacheRecordItem {
+    version: u32,
+    model_id: String,
+    position: usize,
+    capacity: usize,
+    layers: Vec<Option<(TensorData,TensorData)>>,
+    rotary: Vec<RotaryHistory>,
+}
+
+impl Serialize for LlamaKvCacheRecordItem {
+    fn serialize<S: Serializer>(&self,serializer: S) -> Result<S::Ok,S::Error> {
+        let mut tuple = serializer.serialize_tuple(if self.version == 1 {5} else {6})?;
+        tuple.serialize_element(&self.version)?;
+        tuple.serialize_element(&self.model_id)?;
+        tuple.serialize_element(&self.position)?;
+        tuple.serialize_element(&self.capacity)?;
+        tuple.serialize_element(&self.layers)?;
+        if self.version != 1 {tuple.serialize_element(&self.rotary)?;}
+        tuple.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for LlamaKvCacheRecordItem {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self,D::Error> {
+        struct CacheVisitor;
+        impl<'de> Visitor<'de> for CacheVisitor {
+            type Value = LlamaKvCacheRecordItem;
+            fn expecting(&self,f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a versioned Llama KV continuation tuple")
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self,mut fields: A) -> Result<Self::Value,A::Error> {
+                let version = fields.next_element()?.ok_or_else(||A::Error::missing_field("version"))?;
+                if version != 1 && version != 2 {return Err(A::Error::custom("unsupported Llama KV continuation version"));}
+                let model_id = fields.next_element()?.ok_or_else(||A::Error::missing_field("model_id"))?;
+                let position = fields.next_element()?.ok_or_else(||A::Error::missing_field("position"))?;
+                let capacity = fields.next_element()?.ok_or_else(||A::Error::missing_field("capacity"))?;
+                let layers = fields.next_element()?.ok_or_else(||A::Error::missing_field("layers"))?;
+                let rotary = if version == 2 {
+                    fields.next_element()?.ok_or_else(||A::Error::missing_field("rotary"))?
+                } else {Vec::new()};
+                Ok(LlamaKvCacheRecordItem {version,model_id,position,capacity,layers,rotary})
+            }
+        }
+        deserializer.deserialize_tuple(6,CacheVisitor)
+    }
+}
+
 impl<B: Backend> Record<B> for LlamaKvCacheRecord<B> {
-    type Item<S: PrecisionSettings> = (u32,String,usize,usize,Vec<Option<(TensorData,TensorData)>>);
-    fn into_item<S: PrecisionSettings>(self) -> Self::Item<S> {(self.version,self.model_id,self.position,self.capacity,self.layers)}
+    type Item<S: PrecisionSettings> = LlamaKvCacheRecordItem;
+    fn into_item<S: PrecisionSettings>(self) -> Self::Item<S> {
+        LlamaKvCacheRecordItem {version:self.version,model_id:self.model_id,position:self.position,capacity:self.capacity,layers:self.layers,rotary:self.rotary}
+    }
     fn from_item<S: PrecisionSettings>(item: Self::Item<S>,_device: &B::Device) -> Self {
-        Self {version:item.0,model_id:item.1,position:item.2,capacity:item.3,layers:item.4,backend:PhantomData}
+        Self {version:item.version,model_id:item.model_id,position:item.position,capacity:item.capacity,layers:item.layers,rotary:item.rotary,backend:PhantomData}
     }
 }
 
@@ -41,6 +94,8 @@ fn data_shape(key: &TensorData,value: &TensorData,position: usize) -> Result<(),
 }
 
 impl<B: Backend> LlamaKvCacheRecord<B> {
+    pub(crate) fn position(&self) -> usize {self.position}
+
     /// Capture actual completed history with fallible native readback.
     /// Only logical prefixes are read; unused reserved GPU slots are never saved.
     /// model_id must identify the actual frozen weights/configuration/adapters.
@@ -48,6 +103,10 @@ impl<B: Backend> LlamaKvCacheRecord<B> {
         if model_id.is_empty() || cache.layers.is_empty() || cache.position > cache.max_sequence_length {
             return Err(invalid("complete cache and explicit exact model identity are required"));
         }
+        for layer in &cache.layers {layer.rotary.validate(cache.position).map_err(|e|invalid(&e.0))?;}
+        let rotary = if cache.layers.iter().any(|layer|layer.rotary.is_dynamic()) {
+            cache.layers.iter().map(|layer|layer.rotary.clone()).collect()
+        } else {Vec::new()};
         let mut layers = Vec::with_capacity(cache.layers.len());
         for layer in &cache.layers {
             if layer.sequence_length != cache.position || layer.max_sequence_length != cache.max_sequence_length {
@@ -71,7 +130,7 @@ impl<B: Backend> LlamaKvCacheRecord<B> {
             };
             layers.push(payload);
         }
-        Ok(Self {version:1,model_id:model_id.into(),position:cache.position,capacity:cache.max_sequence_length,layers,backend:PhantomData})
+        Ok(Self {version:if rotary.is_empty() {1} else {2},model_id:model_id.into(),position:cache.position,capacity:cache.max_sequence_length,layers,rotary,backend:PhantomData})
     }
 
     /// Save actual frozen host payloads through any existing native recorder.
@@ -82,10 +141,14 @@ impl<B: Backend> LlamaKvCacheRecord<B> {
     /// Restore on an explicit device with unchanged layer count, model and limit.
     /// Physical reserve starts at retained length and grows by the existing cache policy.
     pub fn restore(self,model_id: &str,layers: usize,capacity: usize,device: &B::Device) -> Result<LlamaKvCache<B>,RecorderError> {
-        if self.version != 1 || model_id.is_empty() || self.model_id != model_id || self.layers.len() != layers
+        if !matches!(self.version,1|2) || model_id.is_empty() || self.model_id != model_id || self.layers.len() != layers
             || layers == 0 || capacity == 0 || self.capacity != capacity || self.position > capacity {
             return Err(invalid("record version, exact model identity, layers or original capacity differ"));
         }
+        if (self.version == 1 && !self.rotary.is_empty()) || (self.version == 2 && self.rotary.len() != layers) {
+            return Err(invalid("rotary history count differs from the record version/layers"));
+        }
+        for history in &self.rotary {history.validate(self.position).map_err(|e|invalid(&e.0))?;}
         for layer in &self.layers {
             match layer {
                 Some((key,value)) => data_shape(key,value,self.position)?,
@@ -94,8 +157,10 @@ impl<B: Backend> LlamaKvCacheRecord<B> {
             }
         }
         let position = self.position;
+        let mut rotary = self.rotary.into_iter();
         let layers = self.layers.into_iter().map(|payload| {
             let mut layer = LlamaLayerCache::new(capacity);
+            layer.rotary = rotary.next().unwrap_or_default();
             if let Some((key,value)) = payload {
                 let dtype = key.dtype;
                 layer.key = Some(Tensor::from_data(key,(device,dtype)));

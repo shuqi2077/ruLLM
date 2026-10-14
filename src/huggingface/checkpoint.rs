@@ -2,6 +2,10 @@ use super::*;
 use ruda_store::{ModuleStore, TensorSnapshot};
 use ruda_tensor::api::{DType, Tensor, backend::Backend};
 
+mod encoded;
+mod stacked;
+pub(crate) use stacked::StackedMatrixSource;
+
 pub(crate) struct Checkpoint {
     pub files: Vec<PathBuf>,
     pub tensors: BTreeMap<String, TensorSnapshot>,

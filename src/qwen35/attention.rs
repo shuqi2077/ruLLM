@@ -63,35 +63,32 @@ pub(super) fn causal_mask<B: Backend>(
 }
 
 pub(super) fn text_rope<B: Backend>(
-    config: &Qwen35TextConfig,
+    rotary: &crate::llama::rope::RotaryState,
     start: usize,
     sequence: usize,
     dtype: DType,
     device: &B::Device,
 ) -> (Tensor<B, 4>, Tensor<B, 4>) {
-    let dim = (config.head_dim as f64 * config.rope_parameters.partial_rotary_factor) as usize;
-    let theta = config.rope_parameters.rope_theta as f32;
-    let inverse = (0..dim / 2)
-        .map(|i| theta.powf(-((2 * i) as f32) / dim as f32))
-        .collect::<Vec<_>>();
-    let inv =
-        Tensor::<B, 2>::from_data(TensorData::new(inverse, [1, dim / 2]), (device, DType::F32));
-    let pos = Tensor::<B, 2>::from_data(
-        TensorData::new(
-            (start..start + sequence)
-                .map(|n| n as f32)
-                .collect::<Vec<_>>(),
-            [sequence, 1],
-        ),
-        (device, DType::F32),
-    );
-    let freq = pos * inv;
-    let freq = Tensor::cat(vec![freq.clone(), freq], 1).reshape([1, 1, sequence, dim]);
-    (freq.clone().cos().cast(dtype), freq.sin().cast(dtype))
+    rotary.cos_sin((start..start + sequence).map(|n| n as f32).collect(),
+        1, sequence, start + sequence, dtype, device)
 }
 
+#[cfg(test)]
 pub(super) fn multimodal_rope<B: Backend>(
     config: &Qwen35TextConfig,
+    coordinates: &[[usize; 3]],
+    batch: usize,
+    sequence: usize,
+    dtype: DType,
+    device: &B::Device,
+) -> Result<(Tensor<B, 4>, Tensor<B, 4>), GenerationError> {
+    let rotary = config.rotary_parameters().map_err(|e| GenerationError(e.to_string()))?.state();
+    multimodal_rope_with_state(config, &rotary, coordinates, batch, sequence, dtype, device)
+}
+
+pub(super) fn multimodal_rope_with_state<B: Backend>(
+    config: &Qwen35TextConfig,
+    rotary: &crate::llama::rope::RotaryState,
     coordinates: &[[usize; 3]],
     batch: usize,
     sequence: usize,
@@ -107,10 +104,9 @@ pub(super) fn multimodal_rope<B: Backend>(
     {
         return Err(GenerationError("invalid Qwen3.5 interleaved MRoPE positions or sections".into()));
     }
-    let theta = config.rope_parameters.rope_theta as f32;
-    let inverse = (0..dim / 2)
-        .map(|i| 1.0 / theta.powf((2 * i) as f32 / dim as f32))
-        .collect::<Vec<_>>();
+    let length = coordinates.iter().flatten().max().and_then(|p| p.checked_add(1))
+        .ok_or_else(|| GenerationError("empty or overflowing Qwen3.5 rotary positions".into()))?;
+    let inverse = rotary.frequencies(length);
     let mut frequencies = Vec::with_capacity(coordinates.len() * dim);
     for position in coordinates {
         let row = (0..dim / 2).map(|i| {
@@ -124,7 +120,8 @@ pub(super) fn multimodal_rope<B: Backend>(
     let frequencies = Tensor::<B, 4>::from_data(
         TensorData::new(frequencies, [batch, 1, sequence, dim]), (device, DType::F32),
     );
-    Ok((frequencies.clone().cos().cast(dtype), frequencies.sin().cast(dtype)))
+    Ok(((frequencies.clone().cos() * rotary.attention_factor()).cast(dtype),
+        (frequencies.sin() * rotary.attention_factor()).cast(dtype)))
 }
 
 pub(super) fn rotate<B: Backend>(input: Tensor<B, 4>, cos: Tensor<B, 4>, sin: Tensor<B, 4>) -> Tensor<B, 4> {

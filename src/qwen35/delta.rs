@@ -1,6 +1,11 @@
 use super::*;
 use ruda_tensor::api::{activation::sigmoid, module::conv1d, ops::ConvOptions};
-use rudnn::gated_delta::{GatedDeltaInput, chunk_gated_delta_rule, gated_delta_rule};
+use rudnn::gated_delta::{GatedDeltaInput, chunk_gated_delta_rule, chunk_gated_delta_rule_with_history, gated_delta_rule};
+
+pub(super) struct DeltaHistory<B:Backend> {
+    pub convolution: Tensor<B,3>,
+    pub states: Vec<Tensor<B,4>>,
+}
 
 pub(super) struct Delta<B: Backend> {
     pub qkv: Projection<B>,
@@ -96,8 +101,22 @@ where
         c: &Qwen35TextConfig,
         conv_cache: &mut Option<Tensor<DeviceBackend<R, F, I, BT>, 3>>,
         state: &mut Option<Tensor<DeviceBackend<R, F, I, BT>, 4>>,
-        mut observe: Option<&mut dyn FnMut(&str, Tensor<DeviceBackend<R, F, I, BT>, 3>)>,
+        observe: Option<&mut dyn FnMut(&str, Tensor<DeviceBackend<R, F, I, BT>, 3>)>,
     ) -> Result<Tensor<DeviceBackend<R, F, I, BT>, 3>, GenerationError> {
+        self.forward_impl(x,c,conv_cache,state,observe,false).map(|(output,_)|output)
+    }
+
+    pub(super) fn forward_with_history(&self,x:Tensor<DeviceBackend<R,F,I,BT>,3>,c:&Qwen35TextConfig,
+        conv_cache:&mut Option<Tensor<DeviceBackend<R,F,I,BT>,3>>,state:&mut Option<Tensor<DeviceBackend<R,F,I,BT>,4>>)
+        ->Result<(Tensor<DeviceBackend<R,F,I,BT>,3>,DeltaHistory<DeviceBackend<R,F,I,BT>>),GenerationError> {
+        let (output,history)=self.forward_impl(x,c,conv_cache,state,None,true)?;
+        Ok((output,history.expect("requested delta state history")))
+    }
+
+    fn forward_impl(&self,x:Tensor<DeviceBackend<R,F,I,BT>,3>,c:&Qwen35TextConfig,
+        conv_cache:&mut Option<Tensor<DeviceBackend<R,F,I,BT>,3>>,state:&mut Option<Tensor<DeviceBackend<R,F,I,BT>,4>>,
+        mut observe:Option<&mut dyn FnMut(&str,Tensor<DeviceBackend<R,F,I,BT>,3>)>,record:bool)
+        ->Result<(Tensor<DeviceBackend<R,F,I,BT>,3>,Option<DeltaHistory<DeviceBackend<R,F,I,BT>>>),GenerationError> {
         let [batch, seq, _] = x.dims();
         let (kh, vh, kd, vd) = (
             c.linear_num_key_heads,
@@ -116,6 +135,7 @@ where
             .map(Tensor::clone)
             .unwrap_or_else(|| Tensor::zeros([batch, channels, width], (&device, dtype)));
         let history = Tensor::cat(vec![previous, mixed], 2);
+        let convolution_history=record.then(||history.clone());
         *conv_cache = Some(
             history
                 .clone()
@@ -169,9 +189,18 @@ where
             initial_state: initial.into_primitive().tensor(),
             query_scale: (kd as f32).sqrt().recip(),
         };
-        let result = if recurrent_decode { gated_delta_rule(input) }
-            else { chunk_gated_delta_rule(input, 64) }
-        .map_err(|e| GenerationError(e.to_string()))?;
+        let (result,states)=if record && !recurrent_decode {
+            let output=chunk_gated_delta_rule_with_history(input,64).map_err(|e|GenerationError(e.to_string()))?;
+            (output.result,output.states)
+        } else {
+            let result=if recurrent_decode {gated_delta_rule(input)} else {chunk_gated_delta_rule(input,64)}
+                .map_err(|e|GenerationError(e.to_string()))?;
+            let states=if record {vec![result.final_state.clone()]} else {Vec::new()};
+            (result,states)
+        };
+        let history=convolution_history.map(|convolution|DeltaHistory {
+            convolution,states:states.into_iter().map(|state|Tensor::from_primitive(TensorPrimitive::Float(state))).collect(),
+        });
         *state = Some(Tensor::from_primitive(TensorPrimitive::Float(
             result.final_state,
         )));
@@ -189,7 +218,7 @@ where
         let gated = Self::gated_normalize(y, z, self.norm.clone(), dtype, c.rms_norm_eps)?
             .reshape([batch, seq, values]);
         if let Some(observe) = &mut observe { observe("gated0", gated.clone()); }
-        Ok(self.out.forward(gated))
+        Ok((self.out.forward(gated),history))
     }
 }
 

@@ -86,6 +86,14 @@ impl<B: Backend> DeepseekV2Cache<B> {
     pub fn capacity(&self) -> usize {
         self.limit
     }
+    pub(super) fn truncate(&mut self, position: usize) -> Result<(), GenerationError> {
+        if position > self.position || self.layers.iter().any(|layer| layer.position != self.position) {
+            return Err(GenerationError("invalid compressed MLA rollback boundary".into()));
+        }
+        for layer in &mut self.layers { layer.position = position; }
+        self.position = position;
+        Ok(())
+    }
     pub(super) fn compatible(
         &self,
         layers: usize,

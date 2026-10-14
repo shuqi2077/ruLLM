@@ -36,7 +36,9 @@ mod progress;
 mod responses;
 pub mod structured;
 mod tool_calls;
-pub use batch::{BatchServingConfig, run_continuous_batch};
+pub use batch::{BatchServingConfig, run_continuous_batch, run_continuous_batch_with_prefix,run_continuous_batch_with_prefill};
+#[cfg(feature="gpu-kv")]
+pub use batch::run_continuous_batch_with_gpu_prefill;
 pub use images::run_qwen35_multimodal;
 
 #[derive(Clone, Deserialize)]
