@@ -161,7 +161,7 @@ class ReferenceChecks(unittest.TestCase):
         expected = {
             'src/generation.rs': ['mod control;', 'generate_causal_greedy_stream', 'generate_causal_sampled_stream'],
             'src/generation/sampling.rs': ['mod distribution;', 'clear_workspace'],
-            'src/continuous_batch.rs': ['mod lifecycle;', 'commit_appends', 'cancel_appends'],
+            'src/continuous_batch.rs': ['mod lifecycle;', 'commit_append_prefixes', 'cancel_appends'],
             'src/paged_kv.rs': ['mod tests;', 'pub fn free_page_count', 'pub fn commit_appends'],
             'src/lib.rs': ['ContinuousBatchOptions', 'KvAdmissionPolicy', 'CancelledGeneration'],
         }
