@@ -39,6 +39,29 @@ fn zero_token_request_bypasses_full_pending_queue() {
 }
 
 #[test]
+fn zero_token_request_needs_no_cache_pages() {
+    for policy in [KvAdmissionPolicy::OnDemand, KvAdmissionPolicy::ReserveSequenceCapacity] {
+        let mut scheduler = scheduler(ContinuousBatchOptions { kv_admission: policy, ..Default::default() }, 1);
+        let immediate = scheduler.submit(vec![1, 2, 3], generation(0)).unwrap();
+        assert_eq!(scheduler.pop_finished().unwrap().request_id, immediate);
+        assert!(scheduler.is_idle());
+        assert_eq!(scheduler.snapshot().free_kv_pages, 1);
+    }
+}
+
+#[test]
+fn on_demand_admission_only_requires_prompt_pages() {
+    let mut scheduler = scheduler(ContinuousBatchOptions::default(), 1);
+    let id = scheduler.submit(vec![1, 2], generation(3)).unwrap();
+    let batch = scheduler.schedule().unwrap().unwrap();
+    assert_eq!(batch.sequences[0].request_id, id);
+    scheduler.complete_batch(batch.id, &[3]).unwrap();
+    assert_eq!(scheduler.generated_tokens(id), Some(&[3][..]));
+    scheduler.cancel(id).unwrap().unwrap();
+    assert_eq!(scheduler.snapshot().free_kv_pages, 1);
+}
+
+#[test]
 fn cancellation_is_idempotent_and_returns_partial_generation() {
     let mut scheduler = scheduler(Default::default(), 8);
     let queued = scheduler.submit(vec![1], generation(3)).unwrap();

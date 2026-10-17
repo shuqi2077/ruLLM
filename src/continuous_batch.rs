@@ -379,12 +379,6 @@ impl ContinuousBatchScheduler {
                 kv.max_sequence_length
             )));
         }
-        if total_length.div_ceil(kv.block_size) > kv.num_pages {
-            return Err(ContinuousBatchError(format!(
-                "request length {total_length} needs more than the {} KV pages in the pool",
-                kv.num_pages
-            )));
-        }
         if prompt_token_ids.iter().chain(&generation.eos_token_ids).any(|&id| id < 0) {
             return Err(ContinuousBatchError("prompt and EOS token IDs must be non-negative".into()));
         }

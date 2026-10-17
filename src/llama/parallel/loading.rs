@@ -72,6 +72,7 @@ pub(super) fn load_rank<B: Backend>(
                 rotary_state: rotary.for_layer(index).runtime_state(),
                 rotary_layout: RotaryLayout::HalfSplit,
                 num_query_heads: queries, num_kv_heads: kv_heads, head_dimension: width,
+                sliding_window: 0,
             },
             mlp: LlamaFeedForward { gate_proj, up_proj, down_proj },
             input_layernorm: RmsNorm { gamma: Param::from_tensor(input_norm), epsilon: config.rms_norm_epsilon },
