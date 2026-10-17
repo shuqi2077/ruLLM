@@ -278,10 +278,11 @@ impl ContinuousBatchScheduler {
             return Err(ContinuousBatchError("prefilled request has incomplete state or logits".into()));
         }
         let (token,sampler)=if let Some(sampler)=&request.sampler {
-            let mut next=sampler.clone();let token=next.sample(values).map_err(|e|ContinuousBatchError(e.to_string()))?;
+            let mut next=sampler.clone();let token=next.sample_with_history(values,&request.prompt_token_ids,&request.generated_token_ids)
+                .map_err(|e|ContinuousBatchError(e.to_string()))?;
             next.clear_workspace();(token,Some(next))
         } else {(super::sampling::greedy_token(values,0)?,None)};
-        request.generated_token_ids.push(token);request.sampler=sampler;
+        request.generated_token_ids.push(token);request.history.push(token);request.sampler=sampler;
         let stopped_on_eos=request.eos.contains(&token);
         if stopped_on_eos || request.generated_token_ids.len()>=request.generation.max_new_tokens {
             self.kv_cache.remove_sequence(id)?;

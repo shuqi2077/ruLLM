@@ -187,7 +187,8 @@ impl<'a,B: Backend,M: CausalModel<B>> CausalGenerationSession<'a,B,M> {
         let logits = self.logits.as_ref().ok_or_else(||GenerationError("generation has no pending logits or decode input".into()))?.clone();
         let logits = if let Some(processor) = processor { processor(logits)? } else { logits };
         self.check_logits(&logits)?;
-        let token = if let Some(sampler) = &mut self.sampler {sampler.sample(&read_last_logits(logits)?)?}
+        let token = if let Some(sampler) = &mut self.sampler {
+            sampler.sample_with_history(&read_last_logits(logits)?, &self.output.token_ids[..self.prompt_length], &self.output.generated_token_ids)?}
             else {self.model.greedy_token(logits)?};
         if token < 0 || token as usize >= self.limits.vocab_size {
             return Err(GenerationError(format!("selected token {token} is outside the vocabulary")));

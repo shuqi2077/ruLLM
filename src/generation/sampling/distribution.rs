@@ -13,6 +13,15 @@ impl SamplingWorkspace {
         logits: &[f32],
         config: SamplingConfig,
     ) -> Result<&[f64], GenerationError> {
+        self.fill_with_min_p(logits, config, 0.0)
+    }
+
+    pub(super) fn fill_with_min_p(
+        &mut self,
+        logits: &[f32],
+        config: SamplingConfig,
+        min_p: f64,
+    ) -> Result<&[f64], GenerationError> {
         config.validate()?;
         if logits.is_empty() || logits.len() - 1 > i32::MAX as usize {
             return Err(GenerationError(
@@ -76,6 +85,11 @@ impl SamplingWorkspace {
                 if cumulative <= 1.0 - config.top_p {
                     self.probabilities[token] = 0.0;
                 }
+            }
+        }
+        if min_p > 0.0 {
+            for probability in &mut self.probabilities {
+                if *probability < min_p { *probability = 0.0; }
             }
         }
         let retained: f64 = self.probabilities.iter().sum();

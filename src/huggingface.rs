@@ -60,7 +60,22 @@ struct HuggingFaceLlamaConfig {
     head_dim: Option<usize>,
     eos_token_id: Option<HuggingFaceTokenIds>,
     use_sliding_window: Option<bool>,
+    sliding_window: Option<usize>,
+    max_window_layers: Option<usize>,
     use_mrope: Option<bool>,
+}
+
+/// `(window, first_layer)` of Qwen2 / Mistral sliding-window attention.
+fn sliding_window_spec(source: &HuggingFaceLlamaConfig) -> Option<(usize, usize)> {
+    let window = source.sliding_window.filter(|&window| window > 0)?;
+    match source.model_type.as_deref() {
+        Some("mistral") => Some((window, 0)),
+        Some("qwen2") if source.use_sliding_window.unwrap_or(false) => Some((
+            window,
+            source.max_window_layers.unwrap_or(source.num_hidden_layers),
+        )),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -195,10 +210,14 @@ pub fn load_huggingface_llama<B: Backend>(
     let config_path = model_directory.join(CONFIG_FILE);
     let source: HuggingFaceLlamaConfig = read_json(&config_path)?;
     let rotary = rope::parameters(&source)?;
+    let window = sliding_window_spec(&source);
     let (config, tied_word_embeddings, default_eos_token_ids) = convert_config(source)?;
     let weight_files = discover_weight_files(&model_directory)?;
     let mut model = LlamaForCausalLm::<B>::init_huggingface(&config, &rotary, false, device)
         .map_err(|error| HuggingFaceLoadError(error.to_string()))?;
+    if let Some((window, first_layer)) = window {
+        model.set_sliding_window(window, first_layer);
+    }
     let expected = expected_tensor_paths(config.num_hidden_layers, tied_word_embeddings);
     let mut applied = BTreeSet::new();
     let mut unused = BTreeSet::new();
@@ -269,9 +288,10 @@ pub fn load_huggingface_llama<B: Backend>(
 }
 
 /// Load an unquantized Hugging Face Qwen2 or Qwen2.5 directory. The loader
-/// requires the architecture's three Q/K/V bias tensors, rejects sliding
-/// attention and multimodal RoPE variants, and consumes every checkpoint
-/// tensor instead of silently dropping unsupported state.
+/// requires the architecture's three Q/K/V bias tensors, applies
+/// `sliding_window` from `max_window_layers` when `use_sliding_window` is set,
+/// rejects multimodal RoPE variants, and consumes every
+/// checkpoint tensor instead of silently dropping unsupported state.
 pub fn load_huggingface_qwen2<B: Backend>(
     model_directory: impl AsRef<Path>,
     device: &B::Device,
@@ -280,12 +300,16 @@ pub fn load_huggingface_qwen2<B: Backend>(
     let config_path = model_directory.join(CONFIG_FILE);
     let source: HuggingFaceLlamaConfig = read_json(&config_path)?;
     let rotary = rope::parameters(&source)?;
+    let window = sliding_window_spec(&source);
     let (config, tied_word_embeddings, config_eos_token_ids) = convert_qwen2_config(source)?;
     let default_eos_token_ids =
         load_generation_eos_token_ids(&model_directory, config.vocab_size, config_eos_token_ids)?;
     let weight_files = discover_weight_files(&model_directory)?;
     let mut model = LlamaForCausalLm::<B>::init_huggingface(&config, &rotary, true, device)
         .map_err(|error| HuggingFaceLoadError(error.to_string()))?;
+    if let Some((window, first_layer)) = window {
+        model.set_sliding_window(window, first_layer);
+    }
     let expected = expected_qwen2_tensor_paths(config.num_hidden_layers, tied_word_embeddings);
     let mut applied = BTreeSet::new();
     let mut unused = BTreeSet::new();
@@ -428,23 +452,25 @@ pub(crate) fn dense_parallel_config(
 fn convert_config(
     source: HuggingFaceLlamaConfig,
 ) -> Result<(LlamaConfig, bool, Vec<i32>), HuggingFaceLoadError> {
+    // Mistral shares the Llama decoder and tensor names; its sliding window
+    // is applied by the loader.
     if source
         .model_type
         .as_deref()
-        .is_some_and(|value| value != "llama")
+        .is_some_and(|value| value != "llama" && value != "mistral")
     {
         return Err(HuggingFaceLoadError(format!(
-            "model_type {:?} is not Llama",
+            "model_type {:?} is not Llama or Mistral",
             source.model_type
         )));
     }
     if source.architectures.as_ref().is_some_and(|architectures| {
-        !architectures
-            .iter()
-            .any(|architecture| architecture == "LlamaForCausalLM")
+        !architectures.iter().any(|architecture| {
+            architecture == "LlamaForCausalLM" || architecture == "MistralForCausalLM"
+        })
     }) {
         return Err(HuggingFaceLoadError(format!(
-            "architectures {:?} do not contain LlamaForCausalLM",
+            "architectures {:?} do not contain LlamaForCausalLM or MistralForCausalLM",
             source.architectures
         )));
     }
@@ -546,9 +572,11 @@ fn convert_qwen2_config(
             "Ruda Qwen2 currently requires attention_dropout=0".into(),
         ));
     }
-    if source.use_sliding_window.unwrap_or(false) {
+    if source.use_sliding_window.unwrap_or(false)
+        && source.sliding_window.is_none_or(|window| window == 0)
+    {
         return Err(HuggingFaceLoadError(
-            "Ruda Qwen2 does not yet implement sliding-window attention".into(),
+            "Qwen2 use_sliding_window requires a positive sliding_window".into(),
         ));
     }
     if source.use_mrope.unwrap_or(false) {
@@ -631,7 +659,8 @@ fn append_qwen2_chat_message(prompt: &mut String, message: &Qwen2ChatMessage) {
     prompt.push_str("<|im_end|>\n");
 }
 
-fn render_qwen2_chat_messages(
+/// Render the no-tools, plain-text branch of Qwen2/Qwen2.5's ChatML template.
+pub fn render_qwen2_chat_messages(
     messages: &[Qwen2ChatMessage],
     add_generation_prompt: bool,
 ) -> Result<String, HuggingFaceLoadError> {
@@ -831,12 +860,29 @@ mod tests {
     }
 
     #[test]
-    fn qwen_adapter_rejects_unimplemented_sliding_attention() {
+    fn qwen_adapter_reads_sliding_window_layers() {
         let mut value: serde_json::Value = serde_json::from_str(QWEN_05B_CONFIG).unwrap();
         value["use_sliding_window"] = serde_json::Value::Bool(true);
-        let source = serde_json::from_value(value).unwrap();
+        let source: HuggingFaceLlamaConfig = serde_json::from_value(value.clone()).unwrap();
         let error = convert_qwen2_config(source).unwrap_err();
-        assert!(error.0.contains("sliding-window"));
+        assert!(error.0.contains("sliding_window"));
+        value["sliding_window"] = serde_json::json!(4096);
+        value["max_window_layers"] = serde_json::json!(21);
+        let source: HuggingFaceLlamaConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(sliding_window_spec(&source), Some((4096, 21)));
+        assert!(convert_qwen2_config(source).is_ok());
+    }
+
+    #[test]
+    fn llama3_rope_scaling_keeps_high_and_divides_low_frequencies() {
+        let scaling = serde_json::json!({
+            "rope_type": "llama3", "factor": 8.0, "low_freq_factor": 1.0,
+            "high_freq_factor": 4.0, "original_max_position_embeddings": 8192
+        });
+        let parameters = rope::static_parameters(64, 32768, 10000.0, None, 1.0, Some(&scaling)).unwrap();
+        assert_eq!(parameters.inverse_frequencies[0], 1.0);
+        let lowest = 10000.0_f32.powf(-62.0 / 64.0);
+        assert!((parameters.inverse_frequencies[31] - lowest / 8.0).abs() < 1e-9);
     }
 
     #[test]

@@ -13,7 +13,13 @@ use ruda::runtime::server::ComputeServer;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
+use crate::paged_attention::{self, PagedAttentionBatch};
 use crate::ruda_inference;
+use crate::training::lora::with_lora;
+use crate::training::{
+    LlamaLora, LoraLayer, TrainingBackend, flash_attention, linear_cross_entropy,
+};
+use ruda_kernel::tensor::RudaTensor;
 
 pub(crate) mod awq;
 pub(crate) mod rope;
@@ -29,6 +35,9 @@ use rope::qwen2_rope;
 
 const PACKED_TRAINING_MIN_TOKENS: usize = 32;
 const FLASH_ATTENTION_MIN_SEQUENCE: usize = 512;
+/// Cached prefill at or above this length uses the tiled flash kernel instead
+/// of materialized `[S, S]` scores. Shorter prompts keep the reference path.
+const FLASH_PREFILL_MIN_SEQUENCE: usize = 128;
 
 /// Architecture parameters for a decoder-only Llama model.
 #[derive(Clone, Debug, PartialEq)]
@@ -353,6 +362,8 @@ pub struct LlamaAttention<B: Backend> {
     num_query_heads: usize,
     num_kv_heads: usize,
     head_dimension: usize,
+    /// Sliding-window width in tokens; `0` attends to the whole prefix.
+    sliding_window: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -424,6 +435,7 @@ impl<B: Backend> LlamaAttention<B> {
             num_query_heads: config.num_query_heads,
             num_kv_heads: config.num_kv_heads,
             head_dimension,
+            sliding_window: 0,
         }
     }
 
@@ -488,7 +500,7 @@ impl<B: Backend> LlamaAttention<B> {
         let (query, key, value) = self.project(input, 0, None);
         let key = repeat_kv(key, self.num_query_heads / self.num_kv_heads);
         let value = repeat_kv(value, self.num_query_heads / self.num_kv_heads);
-        self.finish(causal_attention(query, key, value, 0))
+        self.finish(causal_attention_windowed(query, key, value, 0, self.sliding_window))
     }
 
     fn forward_cached(
@@ -506,7 +518,13 @@ impl<B: Backend> LlamaAttention<B> {
         let (key, value) = cache.append(key, value);
         let key = repeat_kv(key, self.num_query_heads / self.num_kv_heads);
         let value = repeat_kv(value, self.num_query_heads / self.num_kv_heads);
-        self.finish(causal_attention(query, key, value, position))
+        self.finish(causal_attention_windowed(
+            query,
+            key,
+            value,
+            position,
+            self.sliding_window,
+        ))
     }
 }
 
@@ -649,23 +667,23 @@ pub struct LlamaForCausalLm<B: Backend> {
 #[derive(Module, Debug)]
 pub struct PackedLlamaForCausalLm<B: Backend> {
     embed_tokens: Embedding<B>,
-    layers: Vec<PackedLlamaDecoderLayer<B>>,
+    pub(crate) layers: Vec<PackedLlamaDecoderLayer<B>>,
     norm: RmsNorm<B>,
     lm_head: Linear<B>,
     max_sequence_length: usize,
 }
 
 #[derive(Module, Debug)]
-struct PackedLlamaDecoderLayer<B: Backend> {
-    self_attn: PackedLlamaAttention<B>,
-    mlp: PackedLlamaFeedForward<B>,
+pub(crate) struct PackedLlamaDecoderLayer<B: Backend> {
+    pub(crate) self_attn: PackedLlamaAttention<B>,
+    pub(crate) mlp: PackedLlamaFeedForward<B>,
     input_layernorm: RmsNorm<B>,
     post_attention_layernorm: RmsNorm<B>,
 }
 
 #[derive(Module, Debug)]
-struct PackedLlamaAttention<B: Backend> {
-    qkv_weight: Param<Tensor<B, 2>>,
+pub(crate) struct PackedLlamaAttention<B: Backend> {
+    pub(crate) qkv_weight: Param<Tensor<B, 2>>,
     qkv_bias: Option<Param<Tensor<B, 1>>>,
     o_proj: Linear<B>,
     rope: RotaryEncoding<B>,
@@ -676,13 +694,14 @@ struct PackedLlamaAttention<B: Backend> {
     num_query_heads: usize,
     num_kv_heads: usize,
     head_dimension: usize,
+    sliding_window: usize,
 }
 
 #[derive(Module, Debug)]
-struct PackedLlamaFeedForward<B: Backend> {
+pub(crate) struct PackedLlamaFeedForward<B: Backend> {
     gate_up_weight: Param<Tensor<B, 2>>,
-    down_proj: Linear<B>,
-    d_ff: usize,
+    pub(crate) down_proj: Linear<B>,
+    pub(crate) d_ff: usize,
 }
 
 
@@ -852,6 +871,24 @@ impl<B: Backend> LlamaForCausalLm<B> {
         hidden
     }
 
+    /// Replace every layer's RoPE table (for example with frequency-scaled
+    /// Llama 3 / linear RoPE). Tables are shared device handles.
+    pub fn set_rotary_encoding(&mut self, rope: RotaryEncoding<B>) {
+        for layer in &mut self.layers {
+            layer.self_attn.rope = rope.clone();
+            layer.self_attn.rotary_state = None;
+        }
+    }
+
+    /// Restrict layers `first_layer..` to a sliding attention window of
+    /// `window` tokens (`0` disables it), matching Mistral (`first_layer = 0`)
+    /// and Qwen2's `max_window_layers`.
+    pub fn set_sliding_window(&mut self, window: usize, first_layer: usize) {
+        for (index, layer) in self.layers.iter_mut().enumerate() {
+            layer.self_attn.sliding_window = if index >= first_layer { window } else { 0 };
+        }
+    }
+
     /// Consume a loaded model and pack projection weights for low-overhead
     /// inference. Checkpoint loading remains unchanged and therefore retains
     /// exact Hugging Face tensor names and validation.
@@ -911,6 +948,7 @@ impl<B: Backend> PackedLlamaAttention<B> {
             num_query_heads,
             num_kv_heads,
             head_dimension,
+            sliding_window,
         } = attention;
         // Preserve the col-major view used by Qwen's LinearLayout::Col.
         // Ruda has optimized decode-time vec-mat kernels for this layout,
@@ -948,6 +986,7 @@ impl<B: Backend> PackedLlamaAttention<B> {
             num_query_heads,
             num_kv_heads,
             head_dimension,
+            sliding_window,
         }
     }
 
@@ -1027,6 +1066,9 @@ impl<B: Backend> PackedLlamaAttention<B> {
         let key = repeat_kv(key, self.num_query_heads / self.num_kv_heads);
         let value = repeat_kv(value, self.num_query_heads / self.num_kv_heads);
         let context = match causal_mask {
+            _ if self.sliding_window > 0 => {
+                causal_attention_windowed(query, key, value, 0, self.sliding_window)
+            }
             Some(mask) => causal_attention_with_mask(query, key, value, mask),
             None => attention(
                 query,
@@ -1088,7 +1130,7 @@ impl<B: Backend> PackedLlamaAttention<B> {
         let (key, value) = cache.append(key, value);
         let key = repeat_kv(key, self.num_query_heads / self.num_kv_heads);
         let value = repeat_kv(value, self.num_query_heads / self.num_kv_heads);
-        let context = causal_attention(query, key, value, position);
+        let context = causal_attention_windowed(query, key, value, position, self.sliding_window);
         self.o_proj.forward(context.swap_dims(1, 2).reshape([
             batch,
             sequence,
@@ -1251,6 +1293,23 @@ where
                 (query, key, value, key_sequence)
             }
         };
+        if (sequence > 1 && sequence >= FLASH_PREFILL_MIN_SEQUENCE)
+            || (self.sliding_window > 0 && key_sequence > self.sliding_window)
+        {
+            // Long prompts (and any windowed attention): tiled online-softmax
+            // attention straight from the dense cache, without materializing
+            // [S, S] scores or a mask.
+            debug_assert_eq!(key_sequence, position + sequence);
+            let context = paged_attention::dense_flash_attention_windowed(
+                query,
+                key,
+                value,
+                position,
+                self.sliding_window,
+            )
+            .reshape([batch, sequence, self.num_query_heads * self.head_dimension]);
+            return self.o_proj.forward(context);
+        }
         let context = if ruda_inference::can_decode_specialized::<R>(&query.device(), query.dtype(), query.dims()) {
             ruda_inference::gqa_decode_attention(query, key, value, key_sequence)
         } else {
@@ -1463,6 +1522,372 @@ where
         let hidden = ruda_inference::rms_norm(hidden, self.norm.gamma.val(), self.norm.epsilon);
         self.lm_head.forward(hidden)
     }
+
+    /// Paged prefill/decode for a scheduled batch. Every row appends
+    /// `batch.sequence` tokens at its own start position into slots already
+    /// reserved in `pools` (`[pages, kv_heads, block_size, head_dim]` per
+    /// layer). Returns logits `[batch, sequence, vocabulary]` for every
+    /// position when `all_positions`, otherwise `[batch, 1, vocabulary]` for
+    /// the last token only.
+    pub(crate) fn forward_paged_ruda(
+        &self,
+        tokens: Tensor<DeviceBackend<R, F, I, BT>, 2, Int>,
+        pools: &[(RudaTensor<R>, RudaTensor<R>)],
+        batch: &PagedAttentionBatch<R>,
+        all_positions: bool,
+    ) -> Tensor<DeviceBackend<R, F, I, BT>, 3> {
+        assert_eq!(pools.len(), self.layers.len(), "one KV pool pair per layer");
+        assert_eq!(tokens.dims(), [batch.batch, batch.sequence]);
+        assert!(
+            batch.max_context <= self.max_sequence_length,
+            "paged context exceeds the model's RoPE capacity"
+        );
+        let mut hidden = self.embed_tokens.forward(tokens);
+        for (layer, (key_pool, value_pool)) in self.layers.iter().zip(pools) {
+            hidden = layer.forward_paged_ruda(hidden, key_pool, value_pool, batch);
+        }
+        let [rows, sequence, width] = hidden.dims();
+        let hidden = if all_positions {
+            hidden
+        } else {
+            hidden.slice([0..rows, sequence - 1..sequence, 0..width])
+        };
+        let hidden = ruda_inference::rms_norm(hidden, self.norm.gamma.val(), self.norm.epsilon);
+        self.lm_head.forward(hidden)
+    }
+}
+
+/// Shape facts needed to size paged KV pools for a packed model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PackedLlamaGeometry {
+    pub num_layers: usize,
+    pub num_query_heads: usize,
+    pub num_kv_heads: usize,
+    pub head_dimension: usize,
+    pub vocab_size: usize,
+    pub max_sequence_length: usize,
+    pub dtype: DType,
+    pub paged_rope: bool,
+}
+
+impl<B: Backend> PackedLlamaForCausalLm<B> {
+    pub(crate) fn geometry(&self) -> PackedLlamaGeometry {
+        let attention = &self.layers[0].self_attn;
+        PackedLlamaGeometry {
+            num_layers: self.layers.len(),
+            num_query_heads: attention.num_query_heads,
+            num_kv_heads: attention.num_kv_heads,
+            head_dimension: attention.head_dimension,
+            vocab_size: self.embed_tokens.weight.dims()[0],
+            max_sequence_length: self.max_sequence_length,
+            dtype: attention.qkv_weight.val().dtype(),
+            paged_rope: self.layers.iter().all(|layer| layer.self_attn.rotary_state.is_none()
+                && layer.self_attn.rope.freq_complex.dims()[1] == layer.self_attn.head_dimension),
+        }
+    }
+
+    /// Adapter shapes for [`crate::LlamaLora::new`].
+    pub fn lora_shapes(&self) -> crate::training::LoraShapes {
+        let attention = &self.layers[0].self_attn;
+        crate::training::LoraShapes {
+            layers: self.layers.len(),
+            hidden: self.embed_tokens.weight.dims()[1],
+            qkv_out: attention.qkv_weight.dims()[1],
+            attention_out: attention.num_query_heads * attention.head_dimension,
+            intermediate: self.layers[0].mlp.d_ff,
+        }
+    }
+
+    /// Fold trained adapters into the base weights (`W += alpha/rank * A B`).
+    pub fn merge_lora(mut self, lora: &crate::training::LlamaLora<B>) -> Self {
+        assert_eq!(lora.layers.len(), self.layers.len(), "one adapter layer per decoder layer");
+        let scale = lora.scale();
+        let add = |param: Param<Tensor<B, 2>>, pair: Option<&crate::training::LoraPair<B>>| {
+            match pair {
+                Some(pair) => param.map(|weight| {
+                    let dtype = weight.dtype();
+                    (weight + pair.merged(scale, dtype)).detach()
+                }),
+                None => param,
+            }
+        };
+        for (layer, adapter) in self.layers.iter_mut().zip(&lora.layers) {
+            let attention = &mut layer.self_attn;
+            attention.qkv_weight = add(attention.qkv_weight.clone(), adapter.qkv.as_ref());
+            attention.o_proj.weight = add(attention.o_proj.weight.clone(), adapter.output.as_ref());
+            let mlp = &mut layer.mlp;
+            mlp.gate_up_weight = add(mlp.gate_up_weight.clone(), adapter.gate_up.as_ref());
+            mlp.down_proj.weight = add(mlp.down_proj.weight.clone(), adapter.down.as_ref());
+        }
+        self
+    }
+
+    /// Weights under Hugging Face Llama/Qwen2 names, linear weights as
+    /// `[out, in]`. `tie_word_embeddings` omits `lm_head.weight`.
+    pub fn huggingface_tensors(&self, tie_word_embeddings: bool) -> Vec<(String, TensorData)> {
+        let mut tensors: Vec<(String, TensorData)> = Vec::new();
+        // Tensors of any rank keep their exact shape in the exported data.
+        macro_rules! push {
+            ($name:expr, $tensor:expr) => {
+                tensors.push(($name, $tensor.into_data()))
+            };
+        }
+        push!("model.embed_tokens.weight".to_string(), self.embed_tokens.weight.val());
+        for (index, layer) in self.layers.iter().enumerate() {
+            let prefix = format!("model.layers.{index}");
+            let attention = &layer.self_attn;
+            let qkv = attention.qkv_weight.val();
+            let width = qkv.dims()[0];
+            let query_width = attention.num_query_heads * attention.head_dimension;
+            let kv_width = attention.num_kv_heads * attention.head_dimension;
+            let ranges = [
+                ("q_proj", 0..query_width),
+                ("k_proj", query_width..query_width + kv_width),
+                ("v_proj", query_width + kv_width..query_width + 2 * kv_width),
+            ];
+            for (name, range) in ranges.iter().cloned() {
+                push!(
+                    format!("{prefix}.self_attn.{name}.weight"),
+                    qkv.clone().slice([0..width, range]).transpose()
+                );
+            }
+            if let Some(bias) = &attention.qkv_bias {
+                for (name, range) in ranges {
+                    push!(format!("{prefix}.self_attn.{name}.bias"), bias.val().slice([range]));
+                }
+            }
+            push!(
+                format!("{prefix}.self_attn.o_proj.weight"),
+                attention.o_proj.weight.val().transpose()
+            );
+            let gate_up = layer.mlp.gate_up_weight.val();
+            let d_ff = layer.mlp.d_ff;
+            push!(
+                format!("{prefix}.mlp.gate_proj.weight"),
+                gate_up.clone().slice([0..width, 0..d_ff]).transpose()
+            );
+            push!(
+                format!("{prefix}.mlp.up_proj.weight"),
+                gate_up.slice([0..width, d_ff..2 * d_ff]).transpose()
+            );
+            push!(
+                format!("{prefix}.mlp.down_proj.weight"),
+                layer.mlp.down_proj.weight.val().transpose()
+            );
+            push!(format!("{prefix}.input_layernorm.weight"), layer.input_layernorm.gamma.val());
+            push!(
+                format!("{prefix}.post_attention_layernorm.weight"),
+                layer.post_attention_layernorm.gamma.val()
+            );
+        }
+        push!("model.norm.weight".to_string(), self.norm.gamma.val());
+        if !tie_word_embeddings {
+            push!("lm_head.weight".to_string(), self.lm_head.weight.val().transpose());
+        }
+        tensors
+    }
+}
+
+impl<B: TrainingBackend> PackedLlamaForCausalLm<B> {
+    /// Final normalized hidden states `[batch, sequence, hidden]` of a full
+    /// causal training forward, with optional LoRA adapters. Attention uses
+    /// the memory-efficient [`flash_attention`] operator.
+    pub fn forward_train_hidden(
+        &self,
+        tokens: Tensor<B, 2, Int>,
+        lora: Option<&LlamaLora<B>>,
+    ) -> Tensor<B, 3> {
+        let sequence = tokens.dims()[1];
+        assert!(
+            sequence <= self.max_sequence_length,
+            "training sequence exceeds the RoPE table"
+        );
+        if let Some(lora) = lora {
+            assert_eq!(lora.layers.len(), self.layers.len(), "one adapter layer per decoder layer");
+        }
+        let scale = lora.map_or(0.0, LlamaLora::scale);
+        let mut hidden = self.embed_tokens.forward(tokens);
+        for (index, layer) in self.layers.iter().enumerate() {
+            let adapter = lora.map(|lora| &lora.layers[index]);
+            hidden = layer.forward_train(hidden, adapter, scale);
+        }
+        self.norm.forward(hidden)
+    }
+
+    /// Token-mean next-token cross-entropy. `targets [batch * sequence]` are
+    /// the labels already shifted to align with `tokens`; negative targets
+    /// are ignored. `normalizer` is the number of valid targets over the
+    /// whole optimizer step (so gradient accumulation sums to a true mean).
+    pub fn train_loss(
+        &self,
+        tokens: Tensor<B, 2, Int>,
+        targets: Tensor<B, 1, Int>,
+        normalizer: usize,
+        lora: Option<&LlamaLora<B>>,
+        chunk_rows: usize,
+    ) -> Tensor<B, 1> {
+        let hidden = self.forward_train_hidden(tokens, lora);
+        let [batch, sequence, width] = hidden.dims();
+        linear_cross_entropy(
+            hidden.reshape([batch * sequence, width]),
+            self.lm_head.weight.val(),
+            targets,
+            normalizer,
+            chunk_rows,
+        )
+    }
+}
+
+impl<B: TrainingBackend> PackedLlamaDecoderLayer<B> {
+    fn forward_train(
+        &self,
+        input: Tensor<B, 3>,
+        adapter: Option<&LoraLayer<B>>,
+        scale: f64,
+    ) -> Tensor<B, 3> {
+        let residual = input.clone();
+        let hidden = residual
+            + self.self_attn.forward_train(self.input_layernorm.forward(input), adapter, scale);
+        let residual = hidden.clone();
+        let normalized = self.post_attention_layernorm.forward(hidden);
+        let mlp = &self.mlp;
+        let gate_up = with_lora(
+            linear(normalized.clone(), mlp.gate_up_weight.val(), None),
+            normalized,
+            adapter.and_then(|adapter| adapter.gate_up.as_ref()),
+            scale,
+        );
+        let [batch, sequence, _] = gate_up.dims();
+        let gate = gate_up.clone().slice([0..batch, 0..sequence, 0..mlp.d_ff]);
+        let up = gate_up.slice([0..batch, 0..sequence, mlp.d_ff..2 * mlp.d_ff]);
+        let activated = silu(gate) * up;
+        residual
+            + with_lora(
+                mlp.down_proj.forward(activated.clone()),
+                activated,
+                adapter.and_then(|adapter| adapter.down.as_ref()),
+                scale,
+            )
+    }
+}
+
+impl<B: TrainingBackend> PackedLlamaAttention<B> {
+    fn forward_train(
+        &self,
+        input: Tensor<B, 3>,
+        adapter: Option<&LoraLayer<B>>,
+        scale: f64,
+    ) -> Tensor<B, 3> {
+        let [batch, sequence, _] = input.dims();
+        let query_width = self.num_query_heads * self.head_dimension;
+        let kv_width = self.num_kv_heads * self.head_dimension;
+        let projected = with_lora(
+            linear(input.clone(), self.qkv_weight.val(), self.qkv_bias.as_ref().map(Param::val)),
+            input,
+            adapter.and_then(|adapter| adapter.qkv.as_ref()),
+            scale,
+        );
+        let split = |range: core::ops::Range<usize>, heads: usize| {
+            projected
+                .clone()
+                .slice([0..batch, 0..sequence, range])
+                .reshape([batch, sequence, heads, self.head_dimension])
+        };
+        // RoPE operates on [B, H, S, D]; attention consumes [B, S, H, D].
+        let rotate = |tensor: Tensor<B, 4>| self.apply_rope(tensor.swap_dims(1, 2), 0).swap_dims(1, 2);
+        let query = rotate(split(0..query_width, self.num_query_heads));
+        let key = rotate(split(query_width..query_width + kv_width, self.num_kv_heads));
+        let value = split(query_width + kv_width..query_width + 2 * kv_width, self.num_kv_heads);
+        let context = flash_attention(query, key, value, self.sliding_window)
+            .reshape([batch, sequence, query_width]);
+        with_lora(
+            self.o_proj.forward(context.clone()),
+            context,
+            adapter.and_then(|adapter| adapter.output.as_ref()),
+            scale,
+        )
+    }
+}
+
+impl<R, F, I, BT> PackedLlamaDecoderLayer<DeviceBackend<R, F, I, BT>>
+where
+    R: DeviceRuntime,
+    R::Server: ComputeServer,
+    R::Device: DeviceOps,
+    F: FloatElement,
+    I: IntElement,
+    BT: BoolElement,
+{
+    fn forward_paged_ruda(
+        &self,
+        input: Tensor<DeviceBackend<R, F, I, BT>, 3>,
+        key_pool: &RudaTensor<R>,
+        value_pool: &RudaTensor<R>,
+        batch: &PagedAttentionBatch<R>,
+    ) -> Tensor<DeviceBackend<R, F, I, BT>, 3> {
+        let residual = input.clone();
+        let normalized = ruda_inference::rms_norm(
+            input,
+            self.input_layernorm.gamma.val(),
+            self.input_layernorm.epsilon,
+        );
+        let attention = self
+            .self_attn
+            .forward_paged_ruda(normalized, key_pool, value_pool, batch);
+        let (hidden, normalized) = ruda_inference::residual_rms_norm(
+            residual,
+            attention,
+            self.post_attention_layernorm.gamma.val(),
+            self.post_attention_layernorm.epsilon,
+        );
+        hidden + self.mlp.forward_ruda(normalized)
+    }
+}
+
+impl<R, F, I, BT> PackedLlamaAttention<DeviceBackend<R, F, I, BT>>
+where
+    R: DeviceRuntime,
+    R::Server: ComputeServer,
+    R::Device: DeviceOps,
+    F: FloatElement,
+    I: IntElement,
+    BT: BoolElement,
+{
+    fn forward_paged_ruda(
+        &self,
+        input: Tensor<DeviceBackend<R, F, I, BT>, 3>,
+        key_pool: &RudaTensor<R>,
+        value_pool: &RudaTensor<R>,
+        batch: &PagedAttentionBatch<R>,
+    ) -> Tensor<DeviceBackend<R, F, I, BT>, 3> {
+        let [rows, sequence, _] = input.dims();
+        let projected = linear(
+            input,
+            self.qkv_weight.val(),
+            self.qkv_bias.as_ref().map(Param::val),
+        );
+        let query = paged_attention::paged_qkv_rope(
+            projected,
+            self.rope.freq_complex.clone(),
+            key_pool,
+            value_pool,
+            batch,
+            self.num_query_heads,
+            self.num_kv_heads,
+            self.head_dimension,
+            self.rotary_layout == RotaryLayout::HalfSplit,
+        );
+        let context = paged_attention::paged_attention(
+            query,
+            key_pool,
+            value_pool,
+            batch,
+            self.num_kv_heads,
+            self.sliding_window,
+        )
+        .reshape([rows, sequence, self.num_query_heads * self.head_dimension]);
+        self.o_proj.forward(context)
+    }
 }
 
 
@@ -1531,12 +1956,28 @@ fn causal_attention_mask<B: Backend>(
     query_start: usize,
     device: &B::Device,
 ) -> Tensor<B, 4> {
+    causal_attention_mask_windowed(query_sequence, key_sequence, query_start, 0, device)
+}
+
+/// Causal mask that also hides keys older than `window` tokens (`0` = none).
+fn causal_attention_mask_windowed<B: Backend>(
+    query_sequence: usize,
+    key_sequence: usize,
+    query_start: usize,
+    window: usize,
+    device: &B::Device,
+) -> Tensor<B, 4> {
     assert!(query_start + query_sequence <= key_sequence);
     let mut mask = Vec::with_capacity(query_sequence * key_sequence);
     for query_index in 0..query_sequence {
         let last_visible_key = query_start + query_index;
+        let first_visible_key = if window > 0 {
+            (last_visible_key + 1).saturating_sub(window)
+        } else {
+            0
+        };
         for key_index in 0..key_sequence {
-            mask.push(if key_index <= last_visible_key {
+            mask.push(if key_index <= last_visible_key && key_index >= first_visible_key {
                 0.0_f32
             } else {
                 -1.0e30_f32
@@ -1586,8 +2027,21 @@ fn causal_attention<B: Backend>(
     assert_eq!(value.dims(), [batch, heads, key_sequence, head_dimension]);
     assert!(query_start + query_sequence <= key_sequence);
 
+    causal_attention_windowed(query, key, value, query_start, 0)
+}
+
+fn causal_attention_windowed<B: Backend>(
+    query: Tensor<B, 4>,
+    key: Tensor<B, 4>,
+    value: Tensor<B, 4>,
+    query_start: usize,
+    window: usize,
+) -> Tensor<B, 4> {
+    let [_, _, query_sequence, _] = query.dims();
+    let key_sequence = key.dims()[2];
     let device = query.device();
-    let mask = causal_attention_mask(query_sequence, key_sequence, query_start, &device);
+    let mask =
+        causal_attention_mask_windowed(query_sequence, key_sequence, query_start, window, &device);
     // Qwen/Llama attention evaluates softmax in FP32 even when Q/K/V and the
     // returned context use a half dtype. This avoids accumulating the
     // normalization denominator at BF16/FP16 precision.

@@ -306,3 +306,36 @@ fn clearing_workspace_preserves_random_stream() {
         assert_eq!(sampler.sample(&[0.0; 16]).unwrap(), reference.sample(&[0.0; 16]).unwrap());
     }
 }
+
+#[test]
+fn optional_penalties_and_min_p_keep_legacy_config_literals() {
+    let config = SamplingConfig { temperature: 1.0, top_k: 0, top_p: 1.0, seed: Some(17) };
+    let options = SamplingOptions { min_p: 0.9, repetition_penalty: 4.0, ..Default::default() };
+    let mut sampler = TokenSampler::new_with_options(config, options).unwrap();
+    for _ in 0..32 {
+        assert_eq!(sampler.sample_with_history(&[4.0, 3.0, 2.0], &[0], &[]).unwrap(), 1);
+    }
+    let penalties = SamplingOptions { repetition_penalty: 2.0, presence_penalty: 0.5,
+        frequency_penalty: 0.25, ..Default::default() };
+    assert_eq!(penalized_logits(&[2.0, -2.0, 3.0], &penalties, &[0], &[1, 1]), vec![1.0, -5.0, 3.0]);
+}
+
+#[test]
+fn sampler_records_preserve_optional_parameters_and_read_legacy_records() {
+    let config = SamplingConfig { seed: Some(7), ..Default::default() };
+    let options = SamplingOptions { min_p: 0.1, repetition_penalty: 1.2, ..Default::default() };
+    let mut sampler = TokenSampler::new_with_options(config, options).unwrap();
+    sampler.sample_with_history(&[1.0, 2.0, 3.0], &[2], &[0]).unwrap();
+    let mut restored = TokenSampler::from_state(serde_json::from_value(
+        serde_json::to_value(sampler.to_state()).unwrap()).unwrap()).unwrap();
+    assert_eq!(restored.options(), options);
+    for _ in 0..32 {
+        assert_eq!(sampler.sample_with_history(&[1.0, 2.0, 3.0], &[2], &[0]).unwrap(),
+            restored.sample_with_history(&[1.0, 2.0, 3.0], &[2], &[0]).unwrap());
+    }
+    let mut legacy = TokenSampler::new(config).unwrap();
+    let mut record = serde_json::to_value(legacy.to_state()).unwrap();
+    record.as_object_mut().unwrap().remove("options");
+    let mut restored = TokenSampler::from_state(serde_json::from_value(record).unwrap()).unwrap();
+    for _ in 0..32 { assert_eq!(legacy.sample(&[1.0, 2.0, 3.0]).unwrap(), restored.sample(&[1.0, 2.0, 3.0]).unwrap()); }
+}

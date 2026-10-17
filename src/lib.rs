@@ -18,6 +18,10 @@ mod causal_draft_batch;
 pub use causal_draft_batch::{CausalDraftBatch, CausalDraftBatchConfig, CausalDraftBatchCache,
     CausalDraftBatchPrefix, SpeculativeBatchModel, DenseCausalBatchModel,
     CausalBatchModel,CausalBatchCache,CausalBatchPrefix,CausalBatchDelta};
+mod openai_server;
+pub mod training;
+mod paged_attention;
+mod paged_engine;
 mod paged_kv;
 mod qwen35;
 mod qwen3;
@@ -55,6 +59,13 @@ pub mod disaggregated;
 #[cfg(feature = "serving")]
 pub mod serving;
 
+pub use openai_server::{OpenAiServerConfig, serve_openai};
+pub use training::{
+    LlamaLora, LoraConfig, LoraTargets, SftDataset, SftLoader, SftTrainer, TrainConfig,
+    export_huggingface_safetensors,
+};
+pub use paged_engine::{BatchStepReport, ContinuousBatchRunner, PagedLlamaEngine};
+
 pub use qwen35::{Qwen35TextConfig, Qwen35MoeConfig, Qwen35TextModel, Qwen35Cache, Qwen35LayerType, Qwen35RopeConfig, LoadedQwen35Text, load_huggingface_qwen35_text, load_huggingface_qwen35_text_packed};
 pub use qwen35::{LoadedQwen35Vision, Qwen35VisionConfig, Qwen35VisionModel, Qwen35VisionOutput, load_huggingface_qwen35_vision};
 pub use qwen35::{Qwen35MultimodalCache, Qwen35MultimodalModel, load_huggingface_qwen35_multimodal};
@@ -82,7 +93,7 @@ pub use llama::parallel::{
 };
 pub use continuous_batch::{
     ContinuousBatchConfig, ContinuousBatchError, ContinuousBatchScheduler, ContinuousBatchSnapshot,
-    FinishedGeneration, ScheduledBatch, ScheduledBatchKind, ScheduledSequence,
+    FinishedGeneration, ScheduledBatch, ScheduledBatchKind, ScheduledSequence, SpeculativeConfig,
     CancelledGeneration, ContinuousBatchOptions, KvAdmissionPolicy,
     BatchFence, BatchLaunchFailure, FencedBatchScheduler,
     DeviceBatchModel, DeviceBatchExecutor, ExecutedBatch, BatchSamplingState,

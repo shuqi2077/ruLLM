@@ -147,7 +147,18 @@ fn residue_first_matmul_shapes_dtypes_and_layouts() {
     type B = Cuda<bf16,i32>;
     let device = CudaDevice::default();
     let (b,m,n) = (2usize,3usize,5usize);
+    // CmmaResidueFirst needs tensor-core fragments of the input type; bf16
+    // WMMA is sm_80+, so Turing (T4) only runs the f16 half of this test.
+    let client = Tensor::<B,1>::zeros([1],&device).into_primitive().tensor().client.clone();
+    let has_cmma = |dtype: DType| {
+        let element: ruda_core::ir::StorageType = dtype.into();
+        client.properties().features.matmul.cmma.iter().any(|config| config.a_type == element && config.b_type == element)
+    };
     for dtype in [DType::BF16,DType::F16] {
+        if !has_cmma(dtype) {
+            eprintln!("skipping {dtype:?}: no CMMA fragments of this type on the device");
+            continue;
+        }
         for (case,k) in [1usize,16,17,31,32,33,148,164].into_iter().enumerate() {
             let left = (0..b*m*k).map(|i| ((i%9) as f32-4.0)/8.0).collect::<Vec<_>>();
             let right = (0..k*n).map(|i| ((i%7) as f32-3.0)/8.0).collect::<Vec<_>>();

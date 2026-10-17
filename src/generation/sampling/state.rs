@@ -1,4 +1,4 @@
-use super::{GenerationError,SamplingConfig,SamplingWorkspace,TokenSampler,ChaCha12Rng};
+use super::{GenerationError,SamplingConfig,SamplingOptions,SamplingWorkspace,TokenSampler,ChaCha12Rng};
 use ruda_model::record::{PrecisionSettings,Record};
 use ruda_tensor::api::backend::Backend;
 
@@ -9,6 +9,8 @@ pub struct TokenSamplerState {
     version: u32,
     config: SamplingConfig,
     rng: Vec<u8>,
+    #[serde(default)]
+    options: SamplingOptions,
 }
 
 impl<B: Backend> Record<B> for TokenSamplerState {
@@ -26,13 +28,14 @@ impl TokenSamplerState {
     pub fn restore(self) -> Result<TokenSampler,GenerationError> {
         if self.version != 1 {return Err(GenerationError("unsupported token sampler record version".into()));}
         self.config.validate()?;
+        self.options.validate()?;
         let bytes = self.rng.as_slice().try_into()
             .map_err(|_|GenerationError("token sampler RNG state has an invalid byte count".into()))?;
         let rng = ChaCha12Rng::deserialize_state(bytes);
         if rng.serialize_state().as_slice() != self.rng.as_slice() {
             return Err(GenerationError("token sampler RNG state is not canonical".into()));
         }
-        Ok(TokenSampler {config:self.config,rng,workspace:SamplingWorkspace::default()})
+        Ok(TokenSampler {config:self.config,options:self.options,rng,workspace:SamplingWorkspace::default()})
     }
 }
 
@@ -40,10 +43,12 @@ impl TokenSampler {
     /// Actual options retained throughout this request.
     pub fn config(&self) -> SamplingConfig {self.config}
 
+    pub fn options(&self) -> SamplingOptions {self.options}
+
     /// Capture exact current RNG state, including the position of buffered draws.
     /// Does not clear scratch buffers, advance sampling or change the source sampler.
     pub fn to_state(&self) -> TokenSamplerState {
-        TokenSamplerState {version:1,config:self.config,rng:self.rng.serialize_state().to_vec()}
+        TokenSamplerState {version:1,config:self.config,rng:self.rng.serialize_state().to_vec(),options:self.options}
     }
 
     /// Resume native request-local sampling from a checked exact RNG record.

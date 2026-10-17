@@ -26,8 +26,9 @@ pub use speculative::{
 };
 pub use awq::{generate_greedy_awq, generate_sampled_awq};
 pub use sampling::{
-    SamplingConfig, SamplingGenerationConfig, TokenSampler, TokenSamplerState, generate_causal_sampled, generate_sampled,
+    SamplingConfig, SamplingOptions, SamplingGenerationConfig, TokenSampler, TokenSamplerState, generate_causal_sampled, generate_sampled,
     generate_sampled_packed, generate_sampled_packed_ruda, generate_causal_sampled_stream,
+    generate_causal_sampled_stream_with_options,
 };
 
 /// Deterministic autoregressive decoding options. Sampling is deliberately not

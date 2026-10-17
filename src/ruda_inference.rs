@@ -47,7 +47,10 @@ where R: DeviceRuntime, R::Server: ComputeServer, R::Device: DeviceOps,
 {
     let [batch, heads, sequence, dimension] = shape;
     let Some(rows) = batch.checked_mul(heads) else { return false; };
-    crate::runtime::supports_two_lane_decode(reduction_width::<R>(device, dtype, rows), dimension, sequence)
+    let shared_bytes = dimension.checked_mul(8).and_then(|bytes| bytes.checked_add(4));
+    sequence == 1 && dimension > 0 && dimension <= u32::MAX as usize
+        && reduction_width::<R>(device, dtype, rows).is_some()
+        && shared_bytes.is_some_and(|bytes| bytes <= R::client(device).properties().hardware.max_shared_memory_size)
 }
 
 pub(crate) fn can_use_elementwise<R>(device: &R::Device, dtype: DType) -> bool
@@ -347,6 +350,9 @@ fn qkv_half_split_rope_kernel<F: Float>(
     }
 }
 
+/// One fixed-width subgroup per (batch, query head). Each lane owns strided
+/// dimensions; for a 64-wide head on 32 lanes this is exactly the original
+/// two-register order, so the rounding boundaries below are unchanged.
 #[ruda(launch)]
 fn gqa_decode_attention_kernel<F: Float>(
     query: &Array<F>,
@@ -357,15 +363,14 @@ fn gqa_decode_attention_kernel<F: Float>(
     kv_heads: u32,
     key_sequence: u32,
     key_capacity: u32,
-    head_dimension: u32,
     scale: f32,
+    #[comptime] head_dimension: usize,
     #[define(F)] _dtype: StorageType,
 ) {
     let query_heads = query_heads as usize;
     let kv_heads = kv_heads as usize;
     let key_sequence = key_sequence as usize;
     let key_capacity = key_capacity as usize;
-    let head_dimension = head_dimension as usize;
     let row = RUDA_POS_X as usize;
     let batch = row / query_heads;
     let query_head = row % query_heads;
@@ -374,9 +379,15 @@ fn gqa_decode_attention_kernel<F: Float>(
     let kv_offset = (batch * kv_heads + kv_head) * key_capacity * head_dimension;
 
     let lane = UNIT_POS_X as usize;
-    let query_0 = f32::cast_from(query[query_offset + lane]);
-    let query_1 = f32::cast_from(query[query_offset + lane + RUDA_DIM_X as usize]);
+    let mut query_values = SharedMemory::<f32>::new(head_dimension);
+    let mut accumulators = SharedMemory::<f32>::new(head_dimension);
     let mut softmax_maximum = SharedMemory::<f32>::new(1usize);
+    let mut dimension = lane;
+    while dimension < head_dimension {
+        query_values[dimension] = f32::cast_from(query[query_offset + dimension]);
+        accumulators[dimension] = 0.0f32;
+        dimension += RUDA_DIM_X as usize;
+    }
     if UNIT_POS_X == 0 {
         softmax_maximum[0] = -3.4028235e38f32;
     }
@@ -387,8 +398,11 @@ fn gqa_decode_attention_kernel<F: Float>(
     for sequence_index in 0..key_sequence {
         let key_offset = kv_offset + sequence_index * head_dimension;
         let mut dot = 0.0f32;
-        dot += query_0 * f32::cast_from(key[key_offset + lane]);
-        dot += query_1 * f32::cast_from(key[key_offset + lane + RUDA_DIM_X as usize]);
+        let mut dimension = lane;
+        while dimension < head_dimension {
+            dot += query_values[dimension] * f32::cast_from(key[key_offset + dimension]);
+            dimension += RUDA_DIM_X as usize;
+        }
         let rounded_dot = f32::cast_from(F::cast_from(plane_sum(dot)));
         let score = f32::cast_from(F::cast_from(rounded_dot * scale));
         if UNIT_POS_X == 0 && score > softmax_maximum[0] {
@@ -402,8 +416,11 @@ fn gqa_decode_attention_kernel<F: Float>(
     for sequence_index in 0..key_sequence {
         let key_offset = kv_offset + sequence_index * head_dimension;
         let mut dot = 0.0f32;
-        dot += query_0 * f32::cast_from(key[key_offset + lane]);
-        dot += query_1 * f32::cast_from(key[key_offset + lane + RUDA_DIM_X as usize]);
+        let mut dimension = lane;
+        while dimension < head_dimension {
+            dot += query_values[dimension] * f32::cast_from(key[key_offset + dimension]);
+            dimension += RUDA_DIM_X as usize;
+        }
         let rounded_dot = f32::cast_from(F::cast_from(plane_sum(dot)));
         let score = f32::cast_from(F::cast_from(rounded_dot * scale));
         denominator += (score - maximum).exp();
@@ -411,23 +428,30 @@ fn gqa_decode_attention_kernel<F: Float>(
 
     // The generic path casts normalized f32 probabilities back to F before
     // multiplying by V. Preserve that rounding boundary as well.
-    let mut accumulator_0 = 0.0f32;
-    let mut accumulator_1 = 0.0f32;
     for sequence_index in 0..key_sequence {
         let key_offset = kv_offset + sequence_index * head_dimension;
         let mut dot = 0.0f32;
-        dot += query_0 * f32::cast_from(key[key_offset + lane]);
-        dot += query_1 * f32::cast_from(key[key_offset + lane + RUDA_DIM_X as usize]);
+        let mut dimension = lane;
+        while dimension < head_dimension {
+            dot += query_values[dimension] * f32::cast_from(key[key_offset + dimension]);
+            dimension += RUDA_DIM_X as usize;
+        }
         let rounded_dot = f32::cast_from(F::cast_from(plane_sum(dot)));
         let score = f32::cast_from(F::cast_from(rounded_dot * scale));
         let probability = f32::cast_from(F::cast_from((score - maximum).exp() / denominator));
-        accumulator_0 += probability * f32::cast_from(value[key_offset + lane]);
-        accumulator_1 +=
-            probability * f32::cast_from(value[key_offset + lane + RUDA_DIM_X as usize]);
+        let mut dimension = lane;
+        while dimension < head_dimension {
+            accumulators[dimension] +=
+                probability * f32::cast_from(value[key_offset + dimension]);
+            dimension += RUDA_DIM_X as usize;
+        }
     }
 
-    output[query_offset + lane] = F::cast_from(accumulator_0);
-    output[query_offset + lane + RUDA_DIM_X as usize] = F::cast_from(accumulator_1);
+    let mut dimension = lane;
+    while dimension < head_dimension {
+        output[query_offset + dimension] = F::cast_from(accumulators[dimension]);
+        dimension += RUDA_DIM_X as usize;
+    }
 }
 
 pub(crate) fn rms_norm<R, F, I, BT, const D: usize>(
@@ -773,10 +797,7 @@ where
     assert_eq!(value.meta.shape(), key.meta.shape());
     assert!(key_sequence > 0 && key_sequence <= key_capacity);
     assert!(kv_heads > 0 && query_heads > 0 && query_heads.is_multiple_of(kv_heads));
-    assert_eq!(
-        head_dimension, subgroup as usize * 2,
-        "decode kernel requires exactly two values per subgroup lane"
-    );
+    assert!(head_dimension > 0, "decode attention requires a non-empty head");
 
     check_kernel_span(query.meta.shape(), query.meta.strides(), "query storage");
     check_kernel_span(key.meta.shape(), key.meta.strides(), "key storage");
@@ -804,8 +825,8 @@ where
         checked_u32(kv_heads, "kv_heads"),
         checked_u32(key_sequence, "key_sequence"),
         checked_u32(key_capacity, "key_capacity"),
-        checked_u32(head_dimension, "head_dimension"),
         1.0f32 / (head_dimension as f32).sqrt(),
+        head_dimension,
         output.dtype.into(),
     );
     Tensor::from_primitive(TensorPrimitive::Float(output))
