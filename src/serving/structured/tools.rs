@@ -38,7 +38,7 @@ fn literal(text: &str) -> String { serde_json::to_string(text).expect("string se
 
 #[cfg(feature = "structured-output")]
 fn marker(tokenizer: &tokenizers::Tokenizer, text: &str) -> String {
-    let plain = literal(text);
+    let plain = text.chars().map(|c| literal(&c.to_string())).collect::<Vec<_>>().join(" ");
     match tokenizer.get_added_tokens_decoder().into_iter().find(|(_, t)| t.special && t.content == text) {
         Some((id, _)) => format!("({plain} | <[{id}]>)"),
         None => plain,
