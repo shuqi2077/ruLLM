@@ -92,9 +92,8 @@ fn rotary_value<F: Float>(
     #[comptime] half_split: bool,
 ) -> F {
     let source = row + (column_base + dimension) * projected.stride(2);
-    if dimension >= rotary_dim {
-        return projected[source];
-    }
+    let mut result = projected[source];
+    if dimension < rotary_dim {
     let mut paired_dimension = 0usize;
     let mut frequency_index = dimension;
     let mut negate = false;
@@ -122,8 +121,10 @@ fn rotary_value<F: Float>(
         projected[paired]
     };
     let frequency = frequency_row * frequencies.stride(0) + frequency_index * frequencies.stride(1);
-    projected[source] * frequencies[frequency]
-        + rotated * frequencies[frequency + frequencies.stride(2)]
+        result = projected[source] * frequencies[frequency]
+            + rotated * frequencies[frequency + frequencies.stride(2)];
+    }
+    result
 }
 
 /// Splits a packed `[B, S, Hq*D + 2*Hkv*D]` projection, applies RoPE at each

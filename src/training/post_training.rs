@@ -558,6 +558,7 @@ impl<B: AutodiffBackend + TrainingBackend + LinearLogProbsBackend> PpoTrainer<B>
         response: Response,
         rewards: &[f32],
     ) -> Result<PpoRollout, TrainError> {
+        self.config.validate()?;
         response.validate(self.actor.model())?;
         response.validate(&self.critic.backbone)?;
         response.validate(&self.reference.model)?;

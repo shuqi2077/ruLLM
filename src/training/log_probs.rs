@@ -174,7 +174,7 @@ impl<B: Backend, C: CheckpointStrategy> LinearLogProbsBackend for Autodiff<B, C>
         targets: IntTensor<Self>,
         chunk_rows: usize,
     ) -> FloatTensor<Self> {
-        let state = LogProbsState {
+        let state: LogProbsState<B> = LogProbsState {
             hidden: hidden.primitive.clone(),
             weight: weight.primitive.clone(),
             targets,
