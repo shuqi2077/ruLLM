@@ -33,7 +33,7 @@ pub struct Response {
 }
 
 impl Response {
-    fn validate<B: Backend>(&self, model: &PackedLlamaForCausalLm<B>) -> Result<(), TrainError> {
+    pub(super) fn validate<B: Backend>(&self, model: &PackedLlamaForCausalLm<B>) -> Result<(), TrainError> {
         let geometry = model.geometry();
         if self.prompt.is_empty()
             || self.completion.is_empty()
@@ -50,7 +50,7 @@ impl Response {
         }
         Ok(())
     }
-    fn inputs<B: Backend>(&self, device: &B::Device, include_last: bool) -> Tensor<B, 2, Int> {
+    pub(super) fn inputs<B: Backend>(&self, device: &B::Device, include_last: bool) -> Tensor<B, 2, Int> {
         let mut tokens = self.prompt.clone();
         tokens.extend(&self.completion);
         if !include_last {
@@ -166,7 +166,7 @@ impl PostTrainingState {
 }
 
 #[derive(Serialize, Deserialize, PartialEq)]
-struct Metadata {
+pub(super) struct Metadata {
     version: u32,
     algorithm: String,
     reference: String,
@@ -174,7 +174,7 @@ struct Metadata {
     options: serde_json::Value,
     state: PostTrainingState,
 }
-fn metadata<B: AutodiffBackend + TrainingBackend>(
+pub(super) fn metadata<B: AutodiffBackend + TrainingBackend>(
     actor: &SftTrainer<B>,
     algorithm: &str,
     reference: &str,
@@ -190,14 +190,14 @@ fn metadata<B: AutodiffBackend + TrainingBackend>(
         state: state.clone(),
     }
 }
-fn write_metadata(path: &Path, meta: &Metadata) -> Result<(), TrainError> {
+pub(super) fn write_metadata(path: &Path, meta: &Metadata) -> Result<(), TrainError> {
     std::fs::write(
         path.join("post-training.json"),
         serde_json::to_vec(meta).map_err(err)?,
     )
     .map_err(err)
 }
-fn read_metadata(path: &Path, expected: &Metadata) -> Result<PostTrainingState, TrainError> {
+pub(super) fn read_metadata(path: &Path, expected: &Metadata) -> Result<PostTrainingState, TrainError> {
     let actual: Metadata =
         serde_json::from_slice(&std::fs::read(path.join("post-training.json")).map_err(err)?)
             .map_err(err)?;

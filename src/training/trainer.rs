@@ -433,21 +433,42 @@ impl<B: AutodiffBackend + TrainingBackend> SftTrainer<B> {
     }
 
     pub(super) fn objective_step(&mut self, count: usize, tokens: usize, update_allowed: bool,
-        mut objective: impl FnMut(&PackedLlamaForCausalLm<B>, Option<&LlamaLora<B>>, usize) -> Result<Tensor<B, 1>, TrainError>,
+        objective: impl FnMut(&PackedLlamaForCausalLm<B>, Option<&LlamaLora<B>>, usize) -> Result<Tensor<B, 1>, TrainError>,
     ) -> Result<StepStats, TrainError> {
+        self.objective_step_inner::<LlamaLora<B>>(count, tokens, update_allowed, None, None, objective)
+            .map(|(stats, _)| stats)
+    }
+
+    pub(super) fn objective_step_with_aux<M: AutodiffModule<B>>(&mut self,
+        count: usize, tokens: usize, auxiliary: &M, auxiliary_max_grad_norm: Option<f32>,
+        objective: impl FnMut(&PackedLlamaForCausalLm<B>, Option<&LlamaLora<B>>, usize) -> Result<Tensor<B, 1>, TrainError>,
+    ) -> Result<(StepStats, GradientsParams), TrainError> {
+        self.objective_step_inner(count, tokens, true, Some(auxiliary), auxiliary_max_grad_norm, objective)
+    }
+
+    fn objective_step_inner<M: AutodiffModule<B>>(&mut self,
+        count: usize, tokens: usize, update_allowed: bool, auxiliary: Option<&M>,
+        auxiliary_max_grad_norm: Option<f32>,
+        mut objective: impl FnMut(&PackedLlamaForCausalLm<B>, Option<&LlamaLora<B>>, usize) -> Result<Tensor<B, 1>, TrainError>,
+    ) -> Result<(StepStats, GradientsParams), TrainError> {
         if count == 0 { return Err(error("an objective update needs at least one sample")); }
         let mut sum = 0.0;
         let mut accumulator = GradientsAccumulator::<PackedLlamaForCausalLm<B>>::new();
         let mut lora_accumulator = GradientsAccumulator::<LlamaLora<B>>::new();
+        let mut auxiliary_accumulator = GradientsAccumulator::<M>::new();
         for index in 0..count {
             let loss = objective(&self.model, self.adapters(), index)?;
             sum += read_scalar(loss.clone())?;
-            let backward = loss.backward();
+            let mut backward = loss.backward();
             match &self.trainable {
                 Trainable::Full(_) => accumulator.accumulate::<B>(&self.model,
-                    GradientsParams::from_grads(backward, &self.model)),
+                    GradientsParams::from_module(&mut backward, &self.model)),
                 Trainable::Lora { adapters, .. } => lora_accumulator.accumulate::<B>(adapters,
-                    GradientsParams::from_grads(backward, adapters)),
+                    GradientsParams::from_module(&mut backward, adapters)),
+            }
+            if let Some(module) = auxiliary {
+                auxiliary_accumulator.accumulate::<B>(module,
+                    GradientsParams::from_module(&mut backward, module));
             }
         }
         let grads = match &self.trainable {
@@ -459,10 +480,15 @@ impl<B: AutodiffBackend + TrainingBackend> SftTrainer<B> {
             Trainable::Full(_) => clip_global_norm::<B, _>(&self.model, &mut grads, self.config.max_grad_norm)?,
             Trainable::Lora { adapters, .. } => clip_global_norm::<B, _>(adapters, &mut grads, self.config.max_grad_norm)?,
         };
+        let (auxiliary_grads, auxiliary_norm) = if let Some(module) = auxiliary {
+            let mut grads = self.synchronize(auxiliary_accumulator.grads())?;
+            let norm = clip_global_norm::<B, _>(module, &mut grads, auxiliary_max_grad_norm)?;
+            (grads, norm)
+        } else { (GradientsParams::new(), 0.0) };
         let learning_rate = self.config.schedule.at(self.state.step);
         sum = self.objective_mean(sum)?;
         let allowed = self.objective_mean(if update_allowed { 1.0 } else { 0.0 })?;
-        let applied = norm.is_finite() && sum.is_finite() && allowed == 1.0;
+        let applied = norm.is_finite() && auxiliary_norm.is_finite() && sum.is_finite() && allowed == 1.0;
         if applied {
             match &mut self.trainable {
                 Trainable::Full(optimizer) => self.model = optimizer.step(learning_rate, self.model.clone(), grads),
@@ -471,7 +497,10 @@ impl<B: AutodiffBackend + TrainingBackend> SftTrainer<B> {
         } else { self.state.skipped_steps += 1; }
         self.state.step += 1;
         self.state.tokens += tokens as u64;
-        Ok(StepStats { step: self.state.step, loss: sum, grad_norm: norm, learning_rate, tokens, applied })
+        let grad_norm = if !norm.is_finite() { norm }
+            else if !auxiliary_norm.is_finite() { auxiliary_norm }
+            else { norm.max(auxiliary_norm) };
+        Ok((StepStats { step: self.state.step, loss: sum, grad_norm, learning_rate, tokens, applied }, auxiliary_grads))
     }
 
     pub fn model(&self) -> &PackedLlamaForCausalLm<B> {

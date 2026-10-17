@@ -64,7 +64,7 @@ pub use training::{
     LlamaLora, LoraConfig, LoraTargets, SftDataset, SftLoader, SftTrainer, TrainConfig,
     export_huggingface_safetensors,
 };
-pub use training::{DpoTrainer, PpoTrainer, GrpoTrainer, ReferencePolicy, ValueCritic,
+pub use training::{DpoTrainer, PpoTrainer, GrpoTrainer, RewardTrainer, ReferencePolicy, ValueCritic,
     Response, PreferencePair, PpoConfig, GrpoConfig, PpoRollout, GrpoRollout, PostTrainingState};
 pub use paged_engine::{BatchStepReport, ContinuousBatchRunner, PagedLlamaEngine};
 

@@ -14,6 +14,52 @@ type F32Train = Autodiff<Cuda<f32, i32>>;
 type Bf16Train = Autodiff<Cuda<bf16, i32>>;
 
 #[test]
+fn reward_trainer_updates_full_or_lora_and_head_and_resumes_joint_optimizer() {
+    type B = F32Train;
+    let device = CudaDevice::default();
+    let model = LlamaForCausalLm::<B>::init_qwen2(&tiny_config(), &device).unwrap().into_packed_training();
+    let directory = std::env::temp_dir().join(format!("rullm-reward-{}", std::process::id()));
+    let pair = PreferencePair {
+        chosen: Response { prompt: vec![1, 2], completion: vec![3, 4, 5], terminal: true },
+        rejected: Response { prompt: vec![1, 2], completion: vec![6], terminal: true },
+    };
+    for lora in [false, true] {
+        let config = TrainConfig::new(8, 1e-3, directory.join(if lora { "lora" } else { "full" }));
+        let actor = || if lora {
+            SftTrainer::lora(model.clone(), LlamaLora::new(model.lora_shapes(), LoraConfig::default(), &device), config.clone(), device.clone())
+        } else { SftTrainer::full(model.clone(), config.clone(), device.clone()) };
+        let mut trainer = RewardTrainer::new(actor(), config.clone());
+        let head_before = trainer.head.weight.val().inner();
+        let actor_before = if lora {
+            trainer.actor.adapters().unwrap().layers[0].qkv.as_ref().unwrap().b.val().inner()
+        } else { trainer.actor.model().layers[0].self_attn.qkv_weight.val().inner() };
+        let stats = trainer.step(&[pair.clone()]).unwrap();
+        assert!(stats.applied && stats.grad_norm > 0.0 && stats.loss.is_finite());
+        assert!(max_difference(head_before, trainer.head.weight.val().inner()) > 0.0);
+        let actor_after = if lora {
+            trainer.actor.adapters().unwrap().layers[0].qkv.as_ref().unwrap().b.val().inner()
+        } else { trainer.actor.model().layers[0].self_attn.qkv_weight.val().inner() };
+        assert!(max_difference(actor_before, actor_after) > 0.0);
+        let rewards = trainer.token_rewards(&pair.chosen).unwrap();
+        assert_eq!(rewards[..2], [0.0, 0.0]);
+        assert_eq!(rewards[2], trainer.score(&pair.chosen).unwrap());
+        trainer.state.data = serde_json::json!({"pair_cursor": 1});
+        let checkpoint = trainer.save_checkpoint().unwrap();
+        let expected = trainer.step(&[pair.clone()]).unwrap();
+        let expected_head = trainer.head.weight.val().inner();
+        let expected_score = trainer.score(&pair.chosen).unwrap();
+        let mut restored = RewardTrainer::new(actor(), config.clone());
+        assert_eq!(restored.load_checkpoint(&checkpoint).unwrap(), 1);
+        assert_eq!(restored.state.data["pair_cursor"], 1);
+        let stats = restored.step(&[pair.clone()]).unwrap();
+        assert!((stats.loss-expected.loss).abs() < 1e-6);
+        assert!(max_difference(expected_head, restored.head.weight.val().inner()) < 1e-6);
+        assert!((restored.score(&pair.chosen).unwrap()-expected_score).abs() < 1e-6);
+    }
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn post_trainers_update_full_lora_and_critic_and_resume_ppo() {
     type B = F32Train;
     let device = CudaDevice::default();
