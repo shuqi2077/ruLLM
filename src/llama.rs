@@ -1540,6 +1540,7 @@ where
         rotary_tables: &[Option<Tensor<DeviceBackend<R, F, I, BT>, 3>>],
     ) -> Tensor<DeviceBackend<R, F, I, BT>, 3> {
         assert_eq!(pools.len(), self.layers.len(), "one KV pool pair per layer");
+        assert_eq!(rotary_tables.len(), self.layers.len(), "one rotary selection per layer");
         assert_eq!(tokens.dims(), [batch.batch, batch.sequence]);
         assert!(
             batch.max_context <= self.max_sequence_length,

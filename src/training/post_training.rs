@@ -97,6 +97,30 @@ fn probabilities<B: TrainingBackend + LinearLogProbsBackend>(
     device: &B::Device,
     chunk: usize,
 ) -> Tensor<B, 1> {
+    // Runtime RoPE depends on the append context. Score each action on the
+    // very prefix used by the categorical sampler, not the final response's
+    // longer rotary context (which would change the old-policy distribution).
+    if model.paged_rotary_states().iter().any(Option::is_some) {
+        let mut prefix = response.prompt.clone();
+        let mut selected = Vec::with_capacity(response.completion.len());
+        for &token in &response.completion {
+            let length = prefix.len();
+            let mut targets = vec![-100; length];
+            targets[length - 1] = token;
+            selected.push(
+                model
+                    .train_log_probs(
+                        Tensor::from_data(TensorData::new(prefix.clone(), [1, length]), device),
+                        Tensor::from_data(TensorData::new(targets, [length]), device),
+                        adapters,
+                        chunk,
+                    )
+                    .slice([length - 1..length]),
+            );
+            prefix.push(token);
+        }
+        return Tensor::cat(selected, 0);
+    }
     let start = response.prompt.len() - 1;
     let end = start + response.completion.len();
     let mut targets = vec![-100; start];
@@ -371,6 +395,33 @@ impl<B: TrainingBackend> ValueCritic<B> {
         }
     }
     fn response_values(&self, response: &Response, device: &B::Device) -> Tensor<B, 1> {
+        if self
+            .backbone
+            .paged_rotary_states()
+            .iter()
+            .any(Option::is_some)
+        {
+            let mut prefix = response.prompt.clone();
+            let mut selected = Vec::with_capacity(response.completion.len() + 1);
+            for t in 0..=response.completion.len() {
+                let length = prefix.len();
+                let hidden = self.backbone.forward_train_hidden(
+                    Tensor::from_data(TensorData::new(prefix.clone(), [1, length]), device),
+                    None,
+                );
+                let width = hidden.dims()[2];
+                selected.push(
+                    self.head
+                        .forward(hidden.slice([0..1, length - 1..length, 0..width]))
+                        .reshape([1])
+                        .cast(DType::F32),
+                );
+                if t < response.completion.len() {
+                    prefix.push(response.completion[t]);
+                }
+            }
+            return Tensor::cat(selected, 0);
+        }
         let hidden = self
             .backbone
             .forward_train_hidden(response.inputs(device, true), None);

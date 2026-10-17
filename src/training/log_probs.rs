@@ -48,6 +48,18 @@ fn calculate<B: Backend>(
     let [weight_width, vocabulary] = weight.dims();
     assert_eq!(width, weight_width);
     assert_eq!(targets.dims(), [rows]);
+    if rows == 0 {
+        let device = hidden.device();
+        return (
+            Tensor::zeros([0], (&device, DType::F32)),
+            upstream.map(|_| {
+                (
+                    Tensor::zeros([0, width], (&device, hidden.dtype())),
+                    Tensor::zeros([width, vocabulary], (&device, weight.dtype())),
+                )
+            }),
+        );
+    }
     let mask = targets
         .clone()
         .greater_equal_elem(0)

@@ -201,6 +201,12 @@ where
         self.rotary.lock().expect("paged rotary lock").rollback(batch_id);
     }
 
+    /// Release completed/cancelled request history, retaining metadata on
+    /// physical pages that may still be reused as a shared prefix.
+    pub fn forget_request(&self, request_id: RequestId) {
+        self.rotary.lock().expect("paged rotary lock").forget(request_id);
+    }
+
     /// Run one scheduled batch and return last-token logits `[rows, vocab]`.
     /// K/V for the batch's new tokens are written into their reserved slots.
     pub fn execute<F, I, BT>(
@@ -333,7 +339,7 @@ where
     /// Drop a request that is not part of the in-flight batch.
     pub fn cancel(&mut self, request_id: RequestId) -> Result<Vec<i32>, GenerationError> {
         let request = self.scheduler.cancel(request_id).map_err(scheduler_error)?;
-        self.engine.rotary.lock().expect("paged rotary lock").forget(request_id);
+        self.engine.forget_request(request_id);
         Ok(request.map_or_else(Vec::new, |request| request.generated_token_ids))
     }
 
@@ -375,7 +381,7 @@ where
                 self.engine.commit_batch(&batch, &counts)?;
                 for row in &batch.sequences {
                     if self.scheduler.generated_tokens(row.request_id).is_none() {
-                        self.engine.rotary.lock().expect("paged rotary lock").forget(row.request_id);
+                        self.engine.forget_request(row.request_id);
                     }
                 }
                 Ok(Some(BatchStepReport {
