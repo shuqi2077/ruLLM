@@ -109,11 +109,11 @@ mod tests {
         alphabet.sort_unstable();
         let vocabulary: serde_json::Map<String, Value> = alphabet.into_iter().enumerate()
             .map(|(id, c)| (c.to_string(), json!(id))).collect();
-        let model: tokenizers::models::bpe::BPE = serde_json::from_value(json!({
+        let model: tokenizers::models::bpe::BPE = serde_json::from_str(&json!({
             "type":"BPE", "vocab":vocabulary, "merges":[], "unk_token":null,
             "continuing_subword_prefix":null, "end_of_word_suffix":null,
             "fuse_unk":false, "byte_fallback":false, "dropout":null
-        })).unwrap();
+        }).to_string()).unwrap();
         let mut tokenizer = tokenizers::Tokenizer::new(model);
         tokenizer.with_pre_tokenizer(Some(tokenizers::pre_tokenizers::byte_level::ByteLevel::new(false, false, false)));
         tokenizer.with_decoder(Some(tokenizers::decoders::byte_level::ByteLevel::default()));
