@@ -1,5 +1,5 @@
 //! Pairwise reward learning and explicit outcome-reward scoring.
-use super::post_training::{metadata, read_metadata, write_metadata};
+use super::post_training::{metadata, read_metadata, write_metadata, reward_many};
 use super::trainer::{load_trainable, read_scalar, save_trainable};
 use super::{
     LlamaLora, PostTrainingState, PreferencePair, Response, SftTrainer, StepStats, TrainConfig,
@@ -24,6 +24,9 @@ fn score<B: TrainingBackend>(
     response: &Response,
     device: &B::Device,
 ) -> Tensor<B, 1> {
+    if response.rotary_context.is_some() {
+        return reward_many(model, adapters, head, &[response], device);
+    }
     let length = response.prompt.len() + response.completion.len();
     let hidden = model.forward_train_hidden(response.inputs(device, true), adapters);
     head.forward(hidden.slice([0..1, length - 1..length, 0..model.lora_shapes().hidden]))
@@ -64,6 +67,7 @@ impl<B: AutodiffBackend + TrainingBackend> RewardTrainer<B> {
     }
 
     pub fn step(&mut self, pairs: &[PreferencePair]) -> Result<StepStats, TrainError> {
+        if pairs.is_empty() { return Err(error("reward training requires a nonempty local preference batch")); }
         for pair in pairs {
             pair.chosen.validate(self.actor.model())?;
             pair.rejected.validate(self.actor.model())?;
@@ -78,16 +82,18 @@ impl<B: AutodiffBackend + TrainingBackend> RewardTrainer<B> {
             .map(|pair| pair.chosen.completion.len() + pair.rejected.completion.len())
             .sum();
         let head = &self.head;
+        let responses: Vec<_> = pairs.iter().map(|p| &p.chosen)
+            .chain(pairs.iter().map(|p| &p.rejected)).collect();
         let (stats, grads) = self.actor.objective_step_with_aux(
-            pairs.len(),
+            1,
             tokens,
             head,
             self.head_config.max_grad_norm,
-            |model, adapters, index| {
-                let pair = &pairs[index];
-                let chosen = score(model, adapters, head, &pair.chosen, &device);
-                let rejected = score(model, adapters, head, &pair.rejected, &device);
-                Ok(log_sigmoid(chosen - rejected).neg() / normalizer)
+            |model, adapters, _| {
+                let scores = reward_many(model, adapters, head, &responses, &device);
+                let n = pairs.len();
+                Ok(log_sigmoid(scores.clone().slice([0..n]) - scores.slice([n..2*n]))
+                    .neg().sum() / normalizer)
             },
         )?;
         if stats.applied {
@@ -111,6 +117,26 @@ impl<B: AutodiffBackend + TrainingBackend> RewardTrainer<B> {
             response,
             self.actor.device(),
         ))
+    }
+
+    /// One packed backbone forward for all complete responses, in input order.
+    pub fn score_batch(&self, responses: &[Response]) -> Result<Vec<f32>, TrainError> {
+        if responses.is_empty() { return Err(error("reward scoring needs at least one response")); }
+        for response in responses { response.validate(self.actor.model())?; }
+        let refs: Vec<_> = responses.iter().collect();
+        reward_many(&self.actor.model().clone().no_grad(),
+            self.actor.adapters().cloned().map(Module::no_grad).as_ref(),
+            &self.head.clone().no_grad(), &refs, self.actor.device())
+            .into_data().convert::<f32>().to_vec::<f32>()
+            .map_err(|e| error(format!("cannot read rewards: {e:?}")))
+    }
+
+    pub fn token_rewards_batch(&self, responses: &[Response]) -> Result<Vec<Vec<f32>>, TrainError> {
+        Ok(responses.iter().zip(self.score_batch(responses)?).map(|(response, reward)| {
+            let mut rewards = vec![0.0; response.completion.len()];
+            *rewards.last_mut().expect("validated completion") = reward;
+            rewards
+        }).collect())
     }
 
     /// Explicit sparse outcome rewards for PPO: zero except the last action.

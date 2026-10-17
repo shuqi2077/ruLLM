@@ -73,6 +73,8 @@ pub struct GenerateRequest {
     #[serde(default)]
     pub tool_choice: Option<Value>,
     #[serde(default)]
+    pub parallel_tool_calls: Option<bool>,
+    #[serde(default)]
     pub response_format: Option<structured::ResponseFormat>,
     #[serde(default)]
     pub grammar: Option<structured::Grammar>,
@@ -145,9 +147,6 @@ impl GenerateRequest {
         }
         if let Some(tools) = &self.tools {
             for tool in tools {
-                if tool.pointer("/function/strict").and_then(Value::as_bool) == Some(true) {
-                    return Err("strict tool schemas require constrained decoding, which this adapter does not implement".into());
-                }
                 if tool.get("type").and_then(Value::as_str) != Some("function")
                     || tool
                         .pointer("/function/name")
@@ -475,9 +474,7 @@ pub fn parse_tool_calls(
     while let Some(start) = remaining.find("<tool_call>") {
         content.push_str(&remaining[..start]);
         let tail = &remaining[start + "<tool_call>".len()..];
-        let end = tail
-            .find("</tool_call>")
-            .ok_or("unterminated model tool call")?;
+        let end = tool_calls::body_end(tail, true)?.ok_or("unterminated model tool call")?;
         let body = tail[..end].trim();
         let call: Value = if body.starts_with("<function=") {
             let (name, arguments) =
@@ -861,6 +858,9 @@ fn finish_response(
         && calls.is_empty()
     {
         return Err("model finished without the required tool call".into());
+    }
+    if job.request.parallel_tool_calls == Some(false) && calls.len() > 1 {
+        return Err("model emitted multiple calls with parallel_tool_calls=false".into());
     }
     if let Some(name) = job
         .request

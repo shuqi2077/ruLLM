@@ -14,14 +14,78 @@ type F32Train = Autodiff<Cuda<f32, i32>>;
 type Bf16Train = Autodiff<Cuda<bf16, i32>>;
 
 #[test]
+fn packed_training_isolates_ragged_documents_and_preserves_full_and_lora_log_probs() {
+    use ruda_nn::attention::PackedSequenceLayout;
+    type B = F32Train;
+    let device = CudaDevice::default();
+    let model = LlamaForCausalLm::<B>::init_qwen2(&tiny_config(), &device).unwrap().into_packed_training();
+    let adapter = LlamaLora::new(model.lora_shapes(), LoraConfig { rank: 4, alpha: 8,
+        targets: LoraTargets::ALL, seed: 21 }, &device);
+    let documents = [vec![1, 2, 3, 4, 5], vec![6, 7], vec![8, 9, 10, 11]];
+    let boundaries = vec![0, 5, 7, 11];
+    let layout = PackedSequenceLayout::new(boundaries.clone(), 11);
+    for adapters in [None, Some(&adapter)] {
+        let flat: Vec<i32> = documents.iter().flatten().copied().collect();
+        let targets = Tensor::<B, 1, Int>::from_data(TensorData::new(flat.clone(), [11]), &device);
+        let packed = model.train_packed_log_probs(Tensor::from_data(TensorData::new(flat, [11]), &device),
+            targets, &layout, adapters, 2);
+        for (index, tokens) in documents.iter().enumerate() {
+            let length = tokens.len();
+            let dense = model.train_log_probs(
+                Tensor::from_data(TensorData::new(tokens.clone(), [1, length]), &device),
+                Tensor::from_data(TensorData::new(tokens.clone(), [length]), &device), adapters, 2);
+            assert!(max_difference(packed.clone().slice([boundaries[index]..boundaries[index+1]]).inner(), dense.inner()) < 3e-5);
+        }
+        let changed = Tensor::<B, 1, Int>::from_data([1, 2, 3, 4, 5, 12, 13, 8, 9, 10, 11], &device);
+        let isolated = model.forward_train_packed_hidden(changed, &layout, adapters);
+        let unchanged = model.forward_train_hidden(Tensor::from_data([[1, 2, 3, 4, 5]], &device), adapters).reshape([5, model.lora_shapes().hidden]);
+        assert!(max_difference(isolated.slice([0..5, 0..model.lora_shapes().hidden]).inner(), unchanged.inner()) < 3e-5);
+    }
+}
+
+#[test]
+fn paged_policy_batch_captures_behavior_probabilities_and_uses_fresh_actor_snapshots() {
+    type B = F32Train;
+    let device = CudaDevice::default();
+    let model = LlamaForCausalLm::<B>::init_qwen2(&tiny_config(), &device).unwrap().into_packed_training();
+    let directory = std::env::temp_dir().join(format!("rullm-paged-rollout-{}", std::process::id()));
+    let config = TrainConfig::new(4, 1e-3, &directory);
+    let critic = ValueCritic::new(model.clone(), &device);
+    let mut trainer = PpoTrainer::new(SftTrainer::full(model.clone(), config.clone(), device.clone()), critic,
+        config, ReferencePolicy::new(model, None, "ref".into()).unwrap(), PpoConfig::default(), 921).unwrap();
+    let batching = crate::ContinuousBatchConfig { max_active_sequences: 2, max_batch_tokens: 4 };
+    let kv = crate::PagedKvCacheConfig { block_size: 4, num_pages: 8, max_sequence_length: 16 };
+    let prompts = vec![vec![1, 2], vec![3, 4, 5, 6, 7]];
+    let seed = trainer.state.clone();
+    let first = trainer.sample_paged(&prompts, 3, &[], batching, kv).unwrap();
+    assert_eq!(first.len(), 2);
+    for (response, prompt) in first.iter().zip(&prompts) {
+        assert_eq!(&response.prompt, prompt);
+        assert_eq!(response.behavior_log_probs.as_ref().unwrap().len(), 3);
+        assert_eq!(response.rotary_context.as_ref().unwrap().len(), prompt.len()+3);
+    }
+    let rewards = vec![vec![0.0, 0.0, 1.0], vec![0.0, 0.0, -0.5]];
+    let fixed = trainer.prepare_rollouts(first.clone(), &rewards).unwrap();
+    for (rollout, response) in fixed.iter().zip(&first) {
+        assert_eq!(&rollout.old_log_probs, response.behavior_log_probs.as_ref().unwrap());
+    }
+    trainer.state = seed.clone();
+    assert_eq!(trainer.sample_paged(&prompts, 3, &[], batching, kv).unwrap(), first);
+    assert!(trainer.step(&fixed).unwrap().applied);
+    trainer.state = seed;
+    let updated = trainer.sample_paged(&prompts, 3, &[], batching, kv).unwrap();
+    assert!(updated.iter().zip(&first).any(|(a, b)| a.behavior_log_probs != b.behavior_log_probs));
+}
+
+#[test]
 fn reward_trainer_updates_full_or_lora_and_head_and_resumes_joint_optimizer() {
     type B = F32Train;
     let device = CudaDevice::default();
     let model = LlamaForCausalLm::<B>::init_qwen2(&tiny_config(), &device).unwrap().into_packed_training();
     let directory = std::env::temp_dir().join(format!("rullm-reward-{}", std::process::id()));
     let pair = PreferencePair {
-        chosen: Response { prompt: vec![1, 2], completion: vec![3, 4, 5], terminal: true },
-        rejected: Response { prompt: vec![1, 2], completion: vec![6], terminal: true },
+        chosen: Response { prompt: vec![1, 2], completion: vec![3, 4, 5], terminal: true, rotary_context: None, behavior_log_probs: None },
+        rejected: Response { prompt: vec![1, 2], completion: vec![6], terminal: true, rotary_context: None, behavior_log_probs: None },
     };
     for lora in [false, true] {
         let config = TrainConfig::new(8, 1e-3, directory.join(if lora { "lora" } else { "full" }));
@@ -66,8 +130,8 @@ fn post_trainers_update_full_lora_and_critic_and_resume_ppo() {
     let model = LlamaForCausalLm::<B>::init_qwen2(&tiny_config(), &device).unwrap().into_packed_training();
     let directory = std::env::temp_dir().join(format!("rullm-post-training-{}", std::process::id()));
     let config = TrainConfig::new(8, 1e-3, &directory);
-    let response = Response { prompt: vec![1, 2], completion: vec![3, 4, 5], terminal: true };
-    let rejected = Response { prompt: vec![1, 2], completion: vec![6], terminal: true };
+    let response = Response { prompt: vec![1, 2], completion: vec![3, 4, 5], terminal: true, rotary_context: None, behavior_log_probs: None };
+    let rejected = Response { prompt: vec![1, 2], completion: vec![6], terminal: true, rotary_context: None, behavior_log_probs: None };
     for lora in [false, true] {
         let actor = if lora {
             SftTrainer::lora(model.clone(), LlamaLora::new(model.lora_shapes(), LoraConfig::default(), &device), config.clone(), device.clone())

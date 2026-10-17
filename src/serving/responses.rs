@@ -134,9 +134,6 @@ fn register(
                 definition.get("format").unwrap_or(&Value::Null)),
                 "parameters":{"type":"object","properties":{"input":{"type":"string"}},"required":["input"],"additionalProperties":false}});
         } else {
-            if definition.get("strict").and_then(Value::as_bool) == Some(true) {
-                return Err("strict tool argument decoding is not implemented".into());
-            }
             if definition.get("parameters").is_none() {
                 return Err(format!("function {name} requires parameters"));
             }
@@ -372,6 +369,7 @@ fn translate(body: Value, config: &Config) -> Result<(GenerateRequest, Output), 
     if !tools.is_empty() {
         request["tools"] = json!(tools);
         request["tool_choice"] = choice;
+        if let Some(parallel) = body.get("parallel_tool_calls") { request["parallel_tool_calls"] = parallel.clone(); }
     } else if choice != json!("auto") && choice != json!("none") {
         return Err("tool_choice requires tools".into());
     }
@@ -554,7 +552,8 @@ impl Output {
                         "model emitted multiple calls with parallel_tool_calls=false".into(),
                     );
                 }
-                let Some(end) = remaining.find("</tool_call>") else {
+                let tail = &remaining["<tool_call>".len()..];
+                let Some(end) = tool_calls::body_end(tail, final_text)? else {
                     if final_text {
                         return Err("unterminated model tool call".into());
                     }
@@ -584,7 +583,7 @@ impl Output {
                     }
                     break;
                 };
-                let end = end + "</tool_call>".len();
+                let end = "<tool_call>".len() + end + "</tool_call>".len();
                 let (_, calls) = parse_tool_calls(
                     &remaining[..end],
                     job.request.tools.as_deref().unwrap_or(&[]),

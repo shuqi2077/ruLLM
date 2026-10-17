@@ -9,7 +9,7 @@ use ruda_model::module::Module;
 use ruda_model::record::{BinFileRecorder, FullPrecisionSettings, Recorder};
 use ruda_nn::{Linear, LinearConfig};
 use ruda_optim::{
-    AdamW, AdamWConfig, GradientsAccumulator, GradientsParams, Optimizer, adaptor::OptimizerAdaptor,
+    AdamW, AdamWConfig, GradientsParams, Optimizer, adaptor::OptimizerAdaptor,
 };
 use ruda_tensor::api::{
     DType, Int, Tensor, TensorData,
@@ -18,6 +18,10 @@ use ruda_tensor::api::{
 };
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+
+mod packed;
+use packed::{probabilities_many, critic_many, behavior_many};
+pub(super) use packed::reward_many;
 
 fn err(e: impl std::fmt::Display) -> TrainError {
     TrainError(e.to_string())
@@ -30,6 +34,15 @@ pub struct Response {
     pub prompt: Vec<i32>,
     pub completion: Vec<i32>,
     pub terminal: bool,
+    /// Actual paged append end for each prompt/completion token. None denotes
+    /// the original full-prefix scoring contract. Includes the last token's
+    /// hypothetical append when generation stops before it enters KV.
+    #[serde(default)]
+    pub rotary_context: Option<Vec<usize>>,
+    /// Captured from the sampling engine, not reconstructed from rounded or
+    /// newly updated weights. Used only for old-policy rollout statistics.
+    #[serde(default)]
+    pub behavior_log_probs: Option<Vec<f32>>,
 }
 
 impl Response {
@@ -47,6 +60,18 @@ impl Response {
             return Err(err(
                 "response needs nonempty prompt/completion within model context and vocabulary",
             ));
+        }
+        if let Some(contexts) = &self.rotary_context {
+            let length = self.prompt.len() + self.completion.len();
+            if contexts.len() != length || contexts.iter().enumerate()
+                .any(|(position, &end)| end <= position || end > length)
+                || contexts.windows(2).any(|pair| pair[0] > pair[1]) {
+                return Err(err("response rotary append contexts do not cover its actual tokens"));
+            }
+        }
+        if self.behavior_log_probs.as_ref().is_some_and(|values| values.len() != self.completion.len()
+            || values.iter().any(|x| !x.is_finite() || *x > 0.0)) {
+            return Err(err("behavior log probabilities must match completion tokens"));
         }
         Ok(())
     }
@@ -97,6 +122,9 @@ fn probabilities<B: TrainingBackend + LinearLogProbsBackend>(
     device: &B::Device,
     chunk: usize,
 ) -> Tensor<B, 1> {
+    if response.rotary_context.is_some() {
+        return probabilities_many(model, adapters, &[response], device, chunk).remove(0);
+    }
     // Runtime RoPE depends on the append context. Score each action on the
     // very prefix used by the categorical sampler, not the final response's
     // longer rotary context (which would change the old-policy distribution).
@@ -278,6 +306,8 @@ fn sample<B: AutodiffBackend + TrainingBackend>(
         prompt: prompt.to_vec(),
         completion: tokens[prompt.len()..].to_vec(),
         terminal,
+        rotary_context: None,
+        behavior_log_probs: None,
     })
 }
 
@@ -307,6 +337,7 @@ impl<B: AutodiffBackend + TrainingBackend + LinearLogProbsBackend> DpoTrainer<B>
     /// One effective-batch update; chosen/rejected likelihoods are completion
     /// sums and every preference pair has equal weight, independent of length.
     pub fn step(&mut self, pairs: &[PreferencePair]) -> Result<StepStats, TrainError> {
+        if pairs.is_empty() { return Err(err("DPO requires a nonempty local preference batch")); }
         for pair in pairs {
             pair.chosen.validate(self.actor.model())?;
             pair.rejected.validate(self.actor.model())?;
@@ -325,30 +356,18 @@ impl<B: AutodiffBackend + TrainingBackend + LinearLogProbsBackend> DpoTrainer<B>
             .iter()
             .map(|p| p.chosen.completion.len() + p.rejected.completion.len())
             .sum();
+        let responses: Vec<_> = pairs.iter().map(|p| &p.chosen)
+            .chain(pairs.iter().map(|p| &p.rejected)).collect();
         self.actor
-            .objective_step(pairs.len(), tokens, true, |model, adapters, index| {
-                let pair = &pairs[index];
-                let chosen = probabilities(model, adapters, &pair.chosen, &device, chunk).sum();
-                let rejected = probabilities(model, adapters, &pair.rejected, &device, chunk).sum();
-                let rc = probabilities(
-                    &reference.model,
-                    reference.adapters.as_ref(),
-                    &pair.chosen,
-                    &device,
-                    chunk,
-                )
-                .sum()
-                .detach();
-                let rr = probabilities(
-                    &reference.model,
-                    reference.adapters.as_ref(),
-                    &pair.rejected,
-                    &device,
-                    chunk,
-                )
-                .sum()
-                .detach();
-                Ok(log_sigmoid(((chosen - rejected) - (rc - rr)) * beta).neg() / normalizer)
+            .objective_step(1, tokens, true, |model, adapters, _| {
+                let policy = Tensor::cat(probabilities_many(model, adapters, &responses, &device, chunk)
+                    .into_iter().map(Tensor::sum).collect(), 0);
+                let frozen = Tensor::cat(probabilities_many(&reference.model, reference.adapters.as_ref(),
+                    &responses, &device, chunk).into_iter().map(|x| x.sum().detach()).collect(), 0);
+                let n = pairs.len();
+                let ratio = policy - frozen;
+                Ok(log_sigmoid((ratio.clone().slice([0..n]) - ratio.slice([n..2*n])) * beta)
+                    .neg().sum() / normalizer)
             })
     }
     pub fn save_checkpoint(&mut self) -> Result<PathBuf, TrainError> {
@@ -395,6 +414,9 @@ impl<B: TrainingBackend> ValueCritic<B> {
         }
     }
     fn response_values(&self, response: &Response, device: &B::Device) -> Tensor<B, 1> {
+        if response.rotary_context.is_some() {
+            return critic_many(self, &[response], device).remove(0);
+        }
         if self
             .backbone
             .paged_rotary_states()
@@ -567,13 +589,16 @@ impl<B: AutodiffBackend + TrainingBackend + LinearLogProbsBackend> PpoTrainer<B>
         }
         let device = self.actor.device();
         let chunk = self.actor.loss_chunk_rows();
-        let old = values(probabilities(
+        let old = match &response.behavior_log_probs {
+            Some(logp) => logp.clone(),
+            None => values(probabilities(
             &self.actor.model().clone().no_grad(),
             self.actor.adapters().cloned().map(Module::no_grad).as_ref(),
             &response,
             device,
             chunk,
-        ))?;
+        ))?,
+        };
         let reference = values(probabilities(
             &self.reference.model,
             self.reference.adapters.as_ref(),
@@ -613,6 +638,7 @@ impl<B: AutodiffBackend + TrainingBackend + LinearLogProbsBackend> PpoTrainer<B>
     }
     /// Token-mean clipped policy/value losses over the entire effective batch.
     pub fn step(&mut self, rollouts: &[PpoRollout]) -> Result<StepStats, TrainError> {
+        if rollouts.is_empty() { return Err(err("PPO requires a nonempty local rollout batch")); }
         self.config.validate()?;
         for rollout in rollouts {
             rollout.validate(self.actor.model())?;
@@ -622,14 +648,12 @@ impl<B: AutodiffBackend + TrainingBackend + LinearLogProbsBackend> PpoTrainer<B>
         let normalizer = self.actor.objective_normalizer(tokens)?;
         let device = self.actor.device().clone();
         let chunk = self.actor.loss_chunk_rows();
-        let mut accumulator = GradientsAccumulator::<ValueCritic<B>>::new();
-        let mut critic_loss = 0.0;
-        for rollout in rollouts {
+        let responses: Vec<_> = rollouts.iter().map(|r| &r.response).collect();
+        let predicted = critic_many(&self.critic, &responses, &device);
+        let mut critic_losses = Vec::new();
+        for (rollout, predicted) in rollouts.iter().zip(predicted) {
             let n = rollout.response.completion.len();
-            let predicted = self
-                .critic
-                .response_values(&rollout.response, &device)
-                .slice([0..n]);
+            let predicted = predicted.slice([0..n]);
             let target = vector(&rollout.returns, &device);
             let loss = (predicted.clone() - target.clone()).square();
             let loss = if let Some(clip) = self.config.value_clip {
@@ -640,33 +664,34 @@ impl<B: AutodiffBackend + TrainingBackend + LinearLogProbsBackend> PpoTrainer<B>
                 loss
             };
             let loss = loss.sum() * (0.5 * self.config.value_coefficient / normalizer);
-            critic_loss += read_scalar(loss.clone())?;
-            accumulator.accumulate::<B>(
-                &self.critic,
-                GradientsParams::from_grads(loss.backward(), &self.critic),
-            );
+            critic_losses.push(loss);
         }
-        let mut grads = self.actor.synchronize(accumulator.grads())?;
+        let loss = Tensor::cat(critic_losses, 0).sum();
+        let mut critic_loss = read_scalar(loss.clone())?;
+        let mut grads = self.actor.synchronize(GradientsParams::from_grads(loss.backward(), &self.critic))?;
         let norm =
             clip_global_norm::<B, _>(&self.critic, &mut grads, self.critic_config.max_grad_norm)?;
         critic_loss = self.actor.objective_mean(critic_loss)?;
         let config = &self.config;
         let mut stats = self.actor.objective_step(
-            rollouts.len(),
+            1,
             tokens,
             norm.is_finite() && critic_loss.is_finite(),
-            |model, adapters, i| {
-                let r = &rollouts[i];
-                let logp = probabilities(model, adapters, &r.response, &device, chunk);
+            |model, adapters, _| {
+                let current = probabilities_many(model, adapters, &responses, &device, chunk);
+                let mut losses = Vec::new();
+                for (r, logp) in rollouts.iter().zip(current) {
                 let ratio = (logp - vector(&r.old_log_probs, &device)).exp();
                 let advantage = vector(&r.advantages, &device);
-                Ok((ratio.clone() * advantage.clone())
+                losses.push((ratio.clone() * advantage.clone())
                     .min_pair(
                         ratio.clamp(1.0 - config.clip_ratio, 1.0 + config.clip_ratio) * advantage,
                     )
                     .sum()
                     .neg()
-                    / normalizer)
+                    / normalizer);
+                }
+                Ok(Tensor::cat(losses, 0).sum())
             },
         )?;
         if stats.applied {
@@ -825,26 +850,21 @@ impl<B: AutodiffBackend + TrainingBackend + LinearLogProbsBackend> GrpoTrainer<B
             (rewards.iter().map(|r| (r - mean).powi(2)).sum::<f32>() / rewards.len() as f32).sqrt();
         let model = self.actor.model().clone().no_grad();
         let adapters = self.actor.adapters().cloned().map(Module::no_grad);
+        for response in &responses {
+            response.validate(&model)?;
+            response.validate(&self.reference.model)?;
+        }
+        let refs: Vec<_> = responses.iter().collect();
+        let old = behavior_many(&model, adapters.as_ref(), &refs, self.actor.device(), self.actor.loss_chunk_rows())?;
+        let reference = probabilities_many(&self.reference.model, self.reference.adapters.as_ref(), &refs,
+            self.actor.device(), self.actor.loss_chunk_rows());
         responses
             .into_iter()
             .zip(rewards)
-            .map(|(response, reward)| {
-                response.validate(&model)?;
-                response.validate(&self.reference.model)?;
-                let old_log_probs = values(probabilities(
-                    &model,
-                    adapters.as_ref(),
-                    &response,
-                    self.actor.device(),
-                    self.actor.loss_chunk_rows(),
-                ))?;
-                let reference_log_probs = values(probabilities(
-                    &self.reference.model,
-                    self.reference.adapters.as_ref(),
-                    &response,
-                    self.actor.device(),
-                    self.actor.loss_chunk_rows(),
-                ))?;
+            .zip(old.into_iter().zip(reference))
+            .map(|((response, reward), (old, reference))| {
+                let old_log_probs = old;
+                let reference_log_probs = values(reference)?;
                 Ok(GrpoRollout {
                     response,
                     old_log_probs,
@@ -856,6 +876,7 @@ impl<B: AutodiffBackend + TrainingBackend + LinearLogProbsBackend> GrpoTrainer<B
     }
     /// Mean of per-response token means, not a length-biased global token mean.
     pub fn step(&mut self, rollouts: &[GrpoRollout]) -> Result<StepStats, TrainError> {
+        if rollouts.is_empty() { return Err(err("GRPO requires a nonempty local rollout batch")); }
         self.config.validate()?;
         for r in rollouts {
             r.response.validate(self.actor.model())?;
@@ -872,17 +893,21 @@ impl<B: AutodiffBackend + TrainingBackend + LinearLogProbsBackend> GrpoTrainer<B
         let chunk = self.actor.loss_chunk_rows();
         let config = &self.config;
         let tokens = rollouts.iter().map(|r| r.response.completion.len()).sum();
+        let responses: Vec<_> = rollouts.iter().map(|r| &r.response).collect();
         self.actor
-            .objective_step(rollouts.len(), tokens, true, |model, adapters, i| {
-                let r = &rollouts[i];
-                let logp = probabilities(model, adapters, &r.response, &device, chunk);
+            .objective_step(1, tokens, true, |model, adapters, _| {
+                let current = probabilities_many(model, adapters, &responses, &device, chunk);
+                let mut losses = Vec::new();
+                for (r, logp) in rollouts.iter().zip(current) {
                 let ratio = (logp.clone() - vector(&r.old_log_probs, &device)).exp();
                 let policy = (ratio.clone() * r.advantage).min_pair(
                     ratio.clamp(1.0 - config.clip_ratio, 1.0 + config.clip_ratio) * r.advantage,
                 );
                 let delta = vector(&r.reference_log_probs, &device) - logp;
                 let kl = delta.clone().exp() - delta - 1.0;
-                Ok((kl * config.kl_coefficient - policy).mean() / normalizer)
+                losses.push((kl * config.kl_coefficient - policy).mean() / normalizer);
+                }
+                Ok(Tensor::cat(losses, 0).sum())
             })
     }
     pub fn save_checkpoint(&mut self) -> Result<PathBuf, TrainError> {

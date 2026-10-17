@@ -11,6 +11,7 @@ pub(crate) mod ops;
 pub(crate) mod log_probs;
 pub mod post_training;
 pub mod reward;
+mod rollout;
 pub(crate) mod trainer;
 
 pub use data::{

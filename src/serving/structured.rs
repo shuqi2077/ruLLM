@@ -3,6 +3,7 @@ use crate::GenerationError;
 use crate::GenerationStep;
 #[cfg(feature = "structured-output")]
 mod llg;
+mod tools;
 
 #[derive(Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -30,6 +31,10 @@ pub enum Grammar {
 }
 
 pub fn requested(request: &GenerateRequest) -> bool {
+    tools::requested(request) || response_requested(request)
+}
+
+fn response_requested(request: &GenerateRequest) -> bool {
     request.grammar.is_some()
         || request
             .response_format
@@ -48,9 +53,10 @@ pub(super) fn validate(request: &GenerateRequest) -> Result<(), String> {
         if request.grammar.is_some() && request.response_format.is_some() {
             return Err("supply grammar or response_format, not both".into());
         }
-        if request.tools_enabled() {
+        if response_requested(request) && request.tools_enabled() {
             return Err("response constraints cannot currently be combined with tool calls".into());
         }
+        if tools::requested(request) { tools::validate(request)?; }
         if let Some(ResponseFormat::JsonSchema { json_schema }) = &request.response_format {
             if json_schema.name.is_empty()
                 || (!json_schema.schema.is_object() && !json_schema.schema.is_boolean())
@@ -89,7 +95,9 @@ impl Decoder {
         #[cfg(feature = "structured-output")]
         {
             use llguidance::api::TopLevelGrammar;
-            let grammar = match (&request.grammar, &request.response_format) {
+            let grammar = if tools::requested(request) {
+                tools::grammar(request, tokenizer, eos)?
+            } else { match (&request.grammar, &request.response_format) {
                 (Some(Grammar::Regex(regex)), _) => TopLevelGrammar::from_regex(regex),
                 (Some(Grammar::Lark(lark)), _) => TopLevelGrammar::from_lark(lark.clone()),
                 (Some(Grammar::Llguidance(grammar)), _) => {
@@ -102,7 +110,7 @@ impl Decoder {
                     TopLevelGrammar::from_json_schema(json_schema.schema.clone())
                 }
                 _ => return Err("missing response constraint".into()),
-            };
+            }};
             let eos_id = eos
                 .first()
                 .copied()

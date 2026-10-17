@@ -238,6 +238,8 @@ pub struct BatchStepReport {
     /// token-producing row (non-final prefill chunks produce none), or the
     /// accepted run of tokens for a speculative `Verify` row.
     pub selected: Vec<(RequestId, i32)>,
+    /// Committed KV token ranges `[start, end)` for rotary-context replay.
+    pub appended: Vec<(RequestId, usize, usize)>,
 }
 
 /// Continuous batching over one packed model: schedule → paged forward →
@@ -246,6 +248,7 @@ pub struct BatchStepReport {
 pub struct ContinuousBatchRunner<R: DeviceRuntime> {
     scheduler: ContinuousBatchScheduler,
     engine: PagedLlamaEngine<R>,
+    selected_log_probs: Vec<(RequestId, f32)>,
 }
 
 impl<R> ContinuousBatchRunner<R>
@@ -267,7 +270,7 @@ where
     {
         let engine = PagedLlamaEngine::new(model, kv, device)?;
         let scheduler = ContinuousBatchScheduler::new_paged(batching, kv).map_err(scheduler_error)?;
-        Ok(Self { scheduler, engine })
+        Ok(Self { scheduler, engine, selected_log_probs: Vec::new() })
     }
 
     pub fn submit(
@@ -355,6 +358,12 @@ where
         self.scheduler.pop_finished()
     }
 
+    /// Raw full-vocabulary, temperature-one log probabilities from the last
+    /// successful sampled step. No extra logits transfer; greedy/verify rows
+    /// are absent. These equal behavior log probabilities only for unfiltered
+    /// categorical requests without penalties, as used by post-training.
+    pub fn selected_log_probs(&self) -> &[(RequestId, f32)] { &self.selected_log_probs }
+
     /// Execute one scheduled batch. Returns `Ok(None)` when nothing is
     /// runnable. A failed device batch is rolled back before the error is
     /// returned, so the same requests can be scheduled again.
@@ -368,17 +377,21 @@ where
         I: IntElement,
         BT: BoolElement,
     {
+        self.selected_log_probs.clear();
         let Some(batch) = self.scheduler.schedule().map_err(scheduler_error)? else {
             return Ok(None);
         };
         match self.run_batch(model, &batch, device) {
-            Ok(selected) => {
+            Ok((selected, log_probs)) => {
                 let counts = batch.sequences.iter().map(|row| {
                     if batch.kind == ScheduledBatchKind::Verify {
                         selected.iter().filter(|(id, _)| *id == row.request_id).count()
                     } else { row.token_ids.len() }
                 }).collect::<Vec<_>>();
                 self.engine.commit_batch(&batch, &counts)?;
+                self.selected_log_probs = log_probs;
+                let appended = batch.sequences.iter().zip(&counts)
+                    .map(|(row, &count)| (row.request_id, row.start_position, row.start_position + count)).collect();
                 for row in &batch.sequences {
                     if self.scheduler.generated_tokens(row.request_id).is_none() {
                         self.engine.forget_request(row.request_id);
@@ -390,6 +403,7 @@ where
                     rows: batch.batch_size(),
                     processed_tokens: batch.batch_size() * batch.next_n(),
                     selected,
+                    appended,
                 }))
             }
             Err(error) => {
@@ -407,7 +421,7 @@ where
         model: &PackedLlamaForCausalLm<DeviceBackend<R, F, I, BT>>,
         batch: &ScheduledBatch,
         device: &R::Device,
-    ) -> Result<Vec<(RequestId, i32)>, GenerationError>
+    ) -> Result<(Vec<(RequestId, i32)>, Vec<(RequestId, f32)>), GenerationError>
     where
         F: FloatElement,
         I: IntElement,
@@ -444,10 +458,10 @@ where
                 .scheduler
                 .complete_verify_batch(batch.id, &argmax)
                 .map_err(scheduler_error)?;
-            return Ok(appended
+            return Ok((appended
                 .into_iter()
                 .flat_map(|(id, tokens)| tokens.into_iter().map(move |token| (id, token)))
-                .collect());
+                .collect(), Vec::new()));
         }
         let logits = self.engine.execute(model, batch, device)?;
         let [rows, vocabulary] = logits.dims();
@@ -465,7 +479,7 @@ where
             return self
                 .scheduler
                 .complete_greedy_batch(batch.id, &argmax)
-                .map(pair_rows)
+                .map(|tokens| (pair_rows(tokens), Vec::new()))
                 .map_err(scheduler_error);
         }
         let values = logits
@@ -478,10 +492,17 @@ where
             .scheduler
             .select_batch_tokens(batch.id, &values, vocabulary)
             .map_err(scheduler_error)?;
-        self.scheduler
+        let tokens = self.scheduler
             .complete_selected_batch(selection)
-            .map(pair_rows)
-            .map_err(scheduler_error)
+            .map_err(scheduler_error)?;
+        let log_probs = batch.sequences.iter().zip(&tokens).zip(values.chunks_exact(vocabulary))
+            .filter(|((_, token), _)| **token >= 0)
+            .map(|((row, &token), logits)| {
+                let maximum = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+                let total = logits.iter().map(|&value| (value as f64 - maximum).exp()).sum::<f64>();
+                (row.request_id, (logits[token as usize] as f64 - maximum - total.ln()) as f32)
+            }).collect();
+        Ok((pair_rows(tokens), log_probs))
     }
 
     /// Step until every submitted request has finished. Fails instead of

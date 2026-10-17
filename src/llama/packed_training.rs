@@ -125,6 +125,109 @@ impl<B: Backend> PackedLlamaForCausalLm<B> {
     }
 }
 
+impl<B: TrainingBackend> PackedLlamaForCausalLm<B> {
+    /// Flat, document-isolated training with optional LoRA. Projections and
+    /// feed-forward layers process the entire payload; each attention call
+    /// uses one document's actual rotary context and memory-efficient backward.
+    pub fn forward_train_packed_hidden(&self, tokens: Tensor<B, 1, Int>,
+        layout: &PackedSequenceLayout, lora: Option<&LlamaLora<B>>) -> Tensor<B, 2> {
+        self.forward_train_packed_hidden_with_contexts(tokens, layout, lora, None)
+    }
+
+    /// Replay actual paged append contexts, one end position per token. This
+    /// preserves the rotary phases of cached keys when runtime RoPE changes.
+    pub fn forward_train_packed_hidden_with_contexts(&self, tokens: Tensor<B, 1, Int>,
+        layout: &PackedSequenceLayout, lora: Option<&LlamaLora<B>>,
+        append_contexts: Option<&[usize]>) -> Tensor<B, 2> {
+        let count = tokens.dims()[0];
+        assert_eq!(count, layout.tokens(), "packed layout must cover the tokens");
+        assert!(count > 0 && layout.max_length() <= self.max_sequence_length);
+        if let Some(contexts) = append_contexts { assert_eq!(contexts.len(), count); }
+        if let Some(lora) = lora {
+            assert_eq!(lora.layers.len(), self.layers.len());
+        }
+        let width = self.lora_shapes().hidden;
+        let scale = lora.map_or(0.0, LlamaLora::scale);
+        let mut hidden = self.embed_tokens.forward(tokens.reshape([1, count]));
+        for (index, layer) in self.layers.iter().enumerate() {
+            let adapter = lora.map(|lora| &lora.layers[index]);
+            let attention = &layer.self_attn;
+            let normalized = layer.input_layernorm.forward(hidden.clone());
+            let projected = with_lora(linear(normalized.clone(), attention.qkv_weight.val(),
+                attention.qkv_bias.as_ref().map(Param::val)), normalized,
+                adapter.and_then(|a| a.qkv.as_ref()), scale);
+            let query_width = attention.num_query_heads * attention.head_dimension;
+            let kv_width = attention.num_kv_heads * attention.head_dimension;
+            let mut contexts = Vec::new();
+            for range in layout.boundaries().windows(2) {
+                let (start, end) = (range[0], range[1]);
+                let length = end - start;
+                if length == 0 { continue; }
+                let split = |range: core::ops::Range<usize>, heads| projected.clone()
+                    .slice([0..1, start..end, range])
+                    .reshape([1, length, heads, attention.head_dimension]);
+                let tables = append_contexts.and_then(|contexts| attention.rotary_state.as_ref().map(|state| {
+                    let mut previous = None;
+                    let contexts: Vec<_> = contexts[start..end].iter().map(|&end| {
+                        let context = state.paged_context(previous, end);
+                        previous = Some(context);
+                        context
+                    }).collect();
+                    state.paged_table(0, &contexts, projected.dtype(), &projected.device())
+                }));
+                let rotate = |x: Tensor<B, 4>| {
+                    let x = x.swap_dims(1, 2);
+                    let x = match &tables {
+                        Some(table) => {
+                            let dimension = table.dims()[1];
+                            let cos = table.clone().slice([0..length, 0..dimension, 0..1])
+                                .reshape([1, 1, length, dimension]);
+                            let sin = table.clone().slice([0..length, 0..dimension, 1..2])
+                                .reshape([1, 1, length, dimension]);
+                            rope::apply_partial(x, cos, sin)
+                        }
+                        None => attention.apply_rope(x, 0),
+                    };
+                    x.swap_dims(1, 2)
+                };
+                let query = rotate(split(0..query_width, attention.num_query_heads));
+                let key = rotate(split(query_width..query_width + kv_width, attention.num_kv_heads));
+                let value = split(query_width + kv_width..query_width + 2 * kv_width, attention.num_kv_heads);
+                contexts.push(flash_attention(query, key, value, attention.sliding_window)
+                    .reshape([1, length, query_width]));
+            }
+            let context = Tensor::cat(contexts, 1);
+            hidden = hidden + with_lora(attention.o_proj.forward(context.clone()), context,
+                adapter.and_then(|a| a.output.as_ref()), scale);
+            let normalized = layer.post_attention_layernorm.forward(hidden.clone());
+            let mlp = &layer.mlp;
+            let gate_up = with_lora(linear(normalized.clone(), mlp.gate_up_weight.val(), None),
+                normalized, adapter.and_then(|a| a.gate_up.as_ref()), scale);
+            let gate = gate_up.clone().slice([0..1, 0..count, 0..mlp.d_ff]);
+            let up = gate_up.slice([0..1, 0..count, mlp.d_ff..2 * mlp.d_ff]);
+            let activated = silu(gate) * up;
+            hidden = hidden + with_lora(mlp.down_proj.forward(activated.clone()), activated,
+                adapter.and_then(|a| a.down.as_ref()), scale);
+        }
+        self.norm.forward(hidden).reshape([count, width])
+    }
+
+    /// State-aligned selected-token log probabilities on isolated flat documents.
+    pub fn train_packed_log_probs(&self, tokens: Tensor<B, 1, Int>, targets: Tensor<B, 1, Int>,
+        layout: &PackedSequenceLayout, lora: Option<&LlamaLora<B>>, chunk_rows: usize) -> Tensor<B, 1>
+    where B: crate::training::LinearLogProbsBackend {
+        self.train_packed_log_probs_with_contexts(tokens, targets, layout, lora, chunk_rows, None)
+    }
+
+    pub fn train_packed_log_probs_with_contexts(&self, tokens: Tensor<B, 1, Int>, targets: Tensor<B, 1, Int>,
+        layout: &PackedSequenceLayout, lora: Option<&LlamaLora<B>>, chunk_rows: usize,
+        append_contexts: Option<&[usize]>) -> Tensor<B, 1>
+    where B: crate::training::LinearLogProbsBackend {
+        crate::training::linear_log_probs(self.forward_train_packed_hidden_with_contexts(tokens, layout, lora, append_contexts),
+            self.lm_head.weight.val(), targets, chunk_rows)
+    }
+}
+
 impl<B: Backend> PackedCausalLanguageModel<B> for LlamaForCausalLm<B> {
     fn forward_packed_hidden(&self, tokens: Tensor<B, 1, Int>, layout: &PackedSequenceLayout) -> Tensor<B, 2> {
         LlamaForCausalLm::forward_packed_hidden(self, tokens, layout)

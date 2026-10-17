@@ -1,5 +1,33 @@
 use super::*;
 
+/// Offset of the closing wire tag, ignoring identical text inside JSON strings.
+pub(super) fn body_end(tail: &str, complete: bool) -> Result<Option<usize>, String> {
+    let body = tail.trim_start();
+    let leading = tail.len() - body.len();
+    if !complete && "<function=".starts_with(body) { return Ok(None); }
+    if body.starts_with("<function=") {
+        let end = tail.find("</tool_call>");
+        return if end.is_none() && complete { Err("unterminated model tool call".into()) } else { Ok(end) };
+    }
+    let mut stream = serde_json::Deserializer::from_str(body).into_iter::<Value>();
+    match stream.next() {
+        Some(Ok(_)) => {
+            let consumed = stream.byte_offset();
+            let rest = &body[consumed..];
+            let suffix = rest.trim_start();
+            if suffix.starts_with("</tool_call>") {
+                return Ok(Some(leading + consumed + rest.len() - suffix.len()));
+            }
+            if !complete && "</tool_call>".starts_with(suffix) { return Ok(None); }
+            Err("model tool call has no closing tag after its JSON payload".into())
+        }
+        Some(Err(error)) if error.is_eof() && !complete => Ok(None),
+        Some(Err(error)) => Err(format!("invalid model tool call: {error}")),
+        None if !complete => Ok(None),
+        None => Err("unterminated model tool call".into()),
+    }
+}
+
 fn parameter_schema<'a>(tool: &'a Value, name: &str) -> Result<&'a Value, String> {
     tool.pointer("/function/parameters/properties")
         .and_then(|properties| properties.get(name))
@@ -146,6 +174,19 @@ pub(super) fn xml_prefix(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn json_wire_tag_inside_argument_strings_is_not_a_call_boundary() {
+        let body = "{\"name\":\"echo\",\"arguments\":{\"text\":\"</tool_call> and \\\"quoted\\\"\"}}";
+        let text = format!("<tool_call>{body}\n</tool_call>tail");
+        for end in 0..body.len() {
+            assert_eq!(body_end(&body[..end], false).unwrap(), None);
+        }
+        let tools = vec![json!({"type":"function","function":{"name":"echo"}})];
+        let (tail, calls) = parse_tool_calls(&text, &tools, "test").unwrap();
+        assert_eq!(tail, "tail");
+        let arguments: Value = serde_json::from_str(calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(arguments["text"], "</tool_call> and \"quoted\"");
+    }
     #[test]
     fn xml_strings_numbers_and_stream_prefix_preserve_arguments() {
         let tools = vec![
