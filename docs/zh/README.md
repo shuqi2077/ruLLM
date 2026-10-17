@@ -4,11 +4,11 @@
 
 [English](../../README.md) | **简体中文** | [日本語](../ja/README.md) | [Deutsch](../de/README.md) | [Русский](../ru/README.md)
 
-基于 Ruda 的 LLM 推理、模型加载与文本生成库。
+基于 Ruda 的 LLM 训练、推理、模型加载与文本生成库。
 
 ruLLM 将分词、模型加载、带缓存的自回归生成及请求调度与 Ruda 张量和计算库组合使用。
 
-- Cargo package：`ruLLM`
+- Cargo package：`ruda-llm`
 - Rust crate：`rullm`
 
 ## 快速开始
@@ -26,13 +26,24 @@ cargo run --release --locked -p ruda-llm --features nvidia-ptx --example qwen35_
 ## 文档
 
 - [模型加载与推理](https://github.com/shuqi2077/RUDA/blob/main/docs/zh/model-inference.md)
+- [Llama／Qwen2 分页执行与连续批处理](../../../docs/zh/model-inference.md#llamaqwen2-分页执行)
+- [OpenAI 风格 HTTP／SSE 服务](../../../docs/zh/model-inference.md#openai-风格-http-服务)
+- [Rust ruLLM SFT 与 LoRA](../../../docs/zh/finetuning.md#rust-rullm-sft-与-lora)
 - [Cargo features](../../Cargo.toml) · [模块入口](../../src/lib.rs)
+
+## 分页推理、服务与 SFT
+
+`ContinuousBatchRunner` 在物理分页 KV 上执行 packed Llama／Qwen2，支持分块预填充、可选前缀缓存、重算抢占和可选的贪心 n-gram 推测验证。`serve_openai` 提供文本补全与对话接口及 SSE 流式输出，不要求另一个 `serving` feature。
+
+`rullm::training` 提供全参数 SFT、FP32 LoRA 适配器、节省显存的注意力前向／反向和分块完整词表损失、AdamW 梯度累积、训练断点恢复及 Hugging Face Safetensors 导出。这些 Rust 接口与 Python `SFTTrainer`、NF4 接口相互独立。
+
+NVIDIA 示例为 `qwen2_continuous_batch`、`qwen2_openai_server`、`qwen2_sft`，均要求 `--features nvidia`。上述指南包含参数、数据格式、恢复方式及模型／类型／RoPE 限制。旧 `SamplingConfig` 字面量保持有效；min-p、重复／存在／频率惩罚通过 `SamplingOptions` 接入。
 
 ## 模型加载与推理
 
 [文档首页](https://github.com/shuqi2077/RUDA/blob/main/docs/zh/README.md) · [训练](https://github.com/shuqi2077/RUDA/blob/main/docs/zh/training.md) · [English](../../README.md)
 
-ruLLM 提供模型加载、分词、带缓存的自回归生成和请求调度。Cargo package 名为 `ruLLM`，Rust 导入名为 `rullm`。
+ruLLM 提供模型加载、分词、带缓存的自回归生成和请求调度。Cargo package 名为 `ruda-llm`，Rust 导入名为 `rullm`。
 
 ### 准备本地模型
 

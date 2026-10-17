@@ -2,7 +2,7 @@
 
 **English** | [简体中文](https://github.com/shuqi2077/RUDA/blob/main/ruLLM/docs/zh/README.md) | [日本語](https://github.com/shuqi2077/RUDA/blob/main/ruLLM/docs/ja/README.md) | [Deutsch](https://github.com/shuqi2077/RUDA/blob/main/ruLLM/docs/de/README.md) | [Русский](https://github.com/shuqi2077/RUDA/blob/main/ruLLM/docs/ru/README.md)
 
-LLM inference, model loading, and text generation on Ruda.
+LLM training, inference, model loading, and text generation on Ruda.
 
 ruLLM combines tokenization, model loading, cached autoregressive generation, and request scheduling with Ruda tensors and compute libraries.
 
@@ -53,7 +53,18 @@ Replace `./models/qwen35` with your model directory. The final arguments select 
 ## Documentation
 
 - [Model loading and inference](https://github.com/shuqi2077/RUDA/blob/main/docs/en/model-inference.md)
+- [Paged inference and continuous batching](../docs/en/model-inference.md#paged-llamaqwen2-execution)
+- [OpenAI-compatible HTTP/SSE server](../docs/en/model-inference.md#openai-compatible-http-server)
+- [Rust ruLLM SFT and LoRA](../docs/en/finetuning.md#rust-rullm-sft-and-lora)
 - [Cargo features](https://github.com/shuqi2077/RUDA/blob/main/ruLLM/Cargo.toml) · [Module exports](https://github.com/shuqi2077/RUDA/blob/main/ruLLM/src/lib.rs)
+
+## Paged inference, serving, and SFT
+
+`ContinuousBatchRunner` executes packed Llama/Qwen2 models over physical paged KV storage, with chunked prefill, optional prefix caching, recompute preemption, and optional greedy n-gram speculative verification. `serve_openai` exposes text completion and chat endpoints, including SSE streaming, without requiring the separate `serving` feature.
+
+`rullm::training` provides full-parameter SFT and FP32 LoRA adapters, memory-efficient attention/backward and chunked full-vocabulary loss, AdamW gradient accumulation, resumable checkpoints, and Hugging Face Safetensors export. These Rust APIs are separate from the Python `SFTTrainer` and NF4 interfaces.
+
+The NVIDIA examples are `qwen2_continuous_batch`, `qwen2_openai_server`, and `qwen2_sft`; all require `--features nvidia`. The linked guides describe arguments, data formats, checkpoint restoration, and supported model/dtype/RoPE boundaries. Existing `SamplingConfig` literals remain valid; optional min-p and repetition/presence/frequency penalties use `SamplingOptions`.
 
 ## Model Loading and Inference
 
