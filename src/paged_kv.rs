@@ -61,8 +61,6 @@ pub struct PagedKvCacheSnapshot {
     pub total_pages: usize,
     /// Pages available for allocation, including unreferenced prefix-cache pages.
     pub free_pages: usize,
-    /// Unreferenced pages that still hold a reusable cached block.
-    pub cached_pages: usize,
     pub sequences: Vec<PagedKvSequenceSnapshot>,
 }
 
@@ -176,6 +174,10 @@ impl PagedKvCacheManager {
 
     pub fn allocated_page_count(&self) -> usize {
         self.config.num_pages - self.available_pages()
+    }
+
+    pub fn cached_page_count(&self) -> usize {
+        self.evictable.len()
     }
 
     pub fn sequence_count(&self) -> usize {
@@ -626,7 +628,6 @@ impl PagedKvCacheManager {
             block_size: self.config.block_size,
             total_pages: self.config.num_pages,
             free_pages: self.available_pages(),
-            cached_pages: self.evictable.len(),
             sequences: self
                 .sequences
                 .iter()
@@ -777,7 +778,7 @@ mod prefix_tests {
         assert_eq!(manager.snapshot().free_pages, 8 - 2);
         manager.remove_sequence(RequestId(2)).unwrap();
         assert_eq!(manager.snapshot().free_pages, 8);
-        assert_eq!(manager.snapshot().cached_pages, 2);
+        assert_eq!(manager.cached_page_count(), 2);
         let matched = manager
             .create_sequence_with_prefix(RequestId(3), &[1, 2, 3, 4, 7])
             .unwrap();
@@ -790,7 +791,7 @@ mod prefix_tests {
         let mut manager = manager(3);
         fill(&mut manager, RequestId(1), &[1, 2, 3, 4, 5]);
         manager.remove_sequence(RequestId(1)).unwrap();
-        assert_eq!(manager.snapshot().cached_pages, 2);
+        assert_eq!(manager.cached_page_count(), 2);
         fill(&mut manager, RequestId(2), &[8, 8, 8, 8, 8, 8]);
         assert_eq!(manager.snapshot().free_pages, 0);
         manager.remove_sequence(RequestId(2)).unwrap();

@@ -63,8 +63,6 @@ pub struct ScheduledSequence {
     pub context_length: usize,
     pub block_table: Vec<KvPageId>,
     pub reservation_id: KvReservationId,
-    /// False for a non-final prefill chunk: its logits are not sampled.
-    pub samples_token: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -148,6 +146,16 @@ pub struct FinishedGeneration {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContinuousBatchSnapshot {
+    pub pending_requests: usize,
+    pub active_requests: usize,
+    pub has_in_flight_batch: bool,
+    pub finished_requests: usize,
+    pub free_kv_pages: usize,
+    pub total_kv_pages: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PagedBatchSnapshot {
     pub pending_requests: usize,
     pub active_requests: usize,
     pub has_in_flight_batch: bool,
@@ -521,7 +529,7 @@ impl ContinuousBatchScheduler {
                 generated_token_ids.len()
             )));
         }
-        if batch.sequences.iter().zip(generated_token_ids).any(|(row, &token)| row.samples_token && token < 0) {
+        if batch.sequences.iter().zip(generated_token_ids).any(|(row, &token)| self.samples_token(row) && token < 0) {
             self.in_flight = Some(batch);
             return Err(ContinuousBatchError("generated token IDs must be non-negative".into()));
         }
@@ -558,7 +566,7 @@ impl ContinuousBatchScheduler {
                 .active
                 .get_mut(&sequence.request_id)
                 .expect("batch ownership was validated before KV commit");
-            if !sequence.samples_token {
+            if sequence.context_length < request.history.len() {
                 request.phase = RequestPhase::NeedsPrefill;
                 continue;
             }
@@ -627,11 +635,28 @@ impl ContinuousBatchScheduler {
             finished_requests: self.finished.len(),
             free_kv_pages: self.kv_cache.free_page_count(),
             total_kv_pages: self.kv_cache.config().num_pages,
+        }
+    }
+
+    pub fn paged_snapshot(&self) -> PagedBatchSnapshot {
+        let snapshot = self.snapshot();
+        PagedBatchSnapshot {
+            pending_requests: snapshot.pending_requests,
+            active_requests: snapshot.active_requests,
+            has_in_flight_batch: snapshot.has_in_flight_batch,
+            finished_requests: snapshot.finished_requests,
+            free_kv_pages: snapshot.free_kv_pages,
+            total_kv_pages: snapshot.total_kv_pages,
             preemptions: self.preemptions,
             prefix_cached_tokens: self.kv_cache.reused_tokens(),
             drafted_tokens: self.drafted_tokens,
             accepted_draft_tokens: self.accepted_draft_tokens,
         }
+    }
+
+    pub fn samples_token(&self, sequence: &ScheduledSequence) -> bool {
+        self.active.get(&sequence.request_id)
+            .is_some_and(|request| sequence.context_length >= request.history.len())
     }
 
     /// Greedy rows with an n-gram draft, each appending `[last, draft...]`.
@@ -675,7 +700,7 @@ impl ContinuousBatchScheduler {
             tokens.push(token);
             tokens.extend(draft);
             let reservation = self.kv_cache.begin_append(id, width)?;
-            rows.push(Self::scheduled_sequence(reservation, tokens, true));
+            rows.push(Self::scheduled_sequence(reservation, tokens));
         }
         self.finish_schedule(ScheduledBatchKind::Verify, rows)
     }
@@ -854,7 +879,7 @@ impl ContinuousBatchScheduler {
                     return Err(error.into());
                 }
             };
-            rows.push(Self::scheduled_sequence(reservation, vec![token], true));
+            rows.push(Self::scheduled_sequence(reservation, vec![token]));
         }
         self.finish_schedule(ScheduledBatchKind::Decode, rows)
     }
@@ -911,7 +936,7 @@ impl ContinuousBatchScheduler {
                 continue;
             }
             let request = &self.active[&request_id];
-            let (start, length, last) = self.prefill_chunk(request_id, request)?;
+            let (start, length, _) = self.prefill_chunk(request_id, request)?;
             debug_assert_eq!(length, next_n);
             let tokens = request.history[start..start + length].to_vec();
             let reservation = match self.kv_cache.begin_append(request_id, next_n) {
@@ -921,7 +946,7 @@ impl ContinuousBatchScheduler {
                     return Err(error.into());
                 }
             };
-            rows.push(Self::scheduled_sequence(reservation, tokens, last));
+            rows.push(Self::scheduled_sequence(reservation, tokens));
         }
         self.finish_schedule(ScheduledBatchKind::Prefill, rows)
     }
@@ -969,7 +994,6 @@ impl ContinuousBatchScheduler {
     fn scheduled_sequence(
         reservation: PagedKvAppendReservation,
         token_ids: Vec<i32>,
-        samples_token: bool,
     ) -> ScheduledSequence {
         ScheduledSequence {
             request_id: reservation.request_id,
@@ -978,7 +1002,6 @@ impl ContinuousBatchScheduler {
             context_length: reservation.context_length,
             block_table: reservation.block_table,
             reservation_id: reservation.id,
-            samples_token,
         }
     }
 
@@ -1118,8 +1141,8 @@ mod tests {
             let batch = scheduler.schedule().unwrap().unwrap();
             assert_eq!(batch.kind, ScheduledBatchKind::Prefill);
             let row = &batch.sequences[0];
-            chunks.push((row.start_position, row.token_ids.clone(), row.samples_token));
-            let last = row.samples_token;
+            let last = scheduler.samples_token(row);
+            chunks.push((row.start_position, row.token_ids.clone(), last));
             scheduler.complete_batch(batch.id, &[42]).unwrap();
             if last {
                 break;
@@ -1164,7 +1187,7 @@ mod tests {
             let done = finished.iter().find(|done| done.request_id == id).unwrap();
             assert_eq!(done.generated_token_ids, vec![3, 3, 3, 3]);
         }
-        let snapshot = scheduler.snapshot();
+        let snapshot = scheduler.paged_snapshot();
         assert!(snapshot.preemptions > 0);
         assert_eq!(snapshot.free_kv_pages, 6);
     }
@@ -1206,7 +1229,7 @@ mod tests {
         assert_eq!(appended, vec![(id, vec![8, 5, 9])]);
         assert_eq!(scheduler.kv_cache.committed_tokens(id).unwrap(), 9);
         assert_eq!(scheduler.generated_tokens(id), Some(&[7, 8, 5, 9][..]));
-        let snapshot = scheduler.snapshot();
+        let snapshot = scheduler.paged_snapshot();
         assert_eq!((snapshot.drafted_tokens, snapshot.accepted_draft_tokens), (3, 2));
         let next = scheduler.schedule().unwrap().unwrap();
         assert_eq!(next.kind, ScheduledBatchKind::Decode);
@@ -1227,6 +1250,6 @@ mod tests {
         // 21 tokens, block 8: two full cached blocks are reused.
         assert_eq!(batch.sequences[0].start_position, 16);
         assert_eq!(batch.sequences[0].token_ids, vec![17, 18, 19, 20, 99]);
-        assert_eq!(scheduler.snapshot().prefix_cached_tokens, 16);
+        assert_eq!(scheduler.paged_snapshot().prefix_cached_tokens, 16);
     }
 }

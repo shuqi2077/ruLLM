@@ -92,7 +92,7 @@ pub use llama::parallel::{
     load_huggingface_llama_tensor_parallel, load_huggingface_qwen2_tensor_parallel,
 };
 pub use continuous_batch::{
-    ContinuousBatchConfig, ContinuousBatchError, ContinuousBatchScheduler, ContinuousBatchSnapshot,
+    ContinuousBatchConfig, ContinuousBatchError, ContinuousBatchScheduler, ContinuousBatchSnapshot, PagedBatchSnapshot,
     FinishedGeneration, ScheduledBatch, ScheduledBatchKind, ScheduledSequence, SpeculativeConfig,
     CancelledGeneration, ContinuousBatchOptions, KvAdmissionPolicy,
     BatchFence, BatchLaunchFailure, FencedBatchScheduler,

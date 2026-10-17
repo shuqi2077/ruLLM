@@ -6,7 +6,7 @@ use crate::llama::PackedLlamaGeometry;
 use crate::paged_attention::PagedAttentionBatch;
 use crate::{
     ContinuousBatchConfig, ContinuousBatchError, ContinuousBatchScheduler,
-    ContinuousBatchSnapshot, FinishedGeneration, GenerationError, GreedyGenerationConfig,
+    PagedBatchSnapshot, FinishedGeneration, GenerationError, GreedyGenerationConfig,
     PackedLlamaForCausalLm, PagedKvCacheConfig, RequestId, SamplingGenerationConfig,
     ScheduledBatch, SpeculativeConfig, SamplingOptions,
 };
@@ -327,8 +327,8 @@ where
         &self.engine
     }
 
-    pub fn snapshot(&self) -> ContinuousBatchSnapshot {
-        self.scheduler.snapshot()
+    pub fn snapshot(&self) -> PagedBatchSnapshot {
+        self.scheduler.paged_snapshot()
     }
 
     pub fn pop_finished(&mut self) -> Option<FinishedGeneration> {
@@ -386,7 +386,7 @@ where
                 .sequences
                 .iter()
                 .zip(tokens)
-                .filter(|(row, _)| row.samples_token)
+                .filter(|(_, token)| *token >= 0)
                 .map(|(row, token)| (row.request_id, token))
                 .collect()
         };

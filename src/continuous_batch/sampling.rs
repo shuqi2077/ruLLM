@@ -47,7 +47,7 @@ impl ContinuousBatchScheduler {
     pub(crate) fn batch_requires_logits(&self, batch_id: u64) -> Result<bool, ContinuousBatchError> {
         let batch = self.in_flight_batch(batch_id)?;
         Ok(batch.sequences.iter().any(|row| {
-            row.samples_token
+            self.samples_token(row)
                 && self
                     .active
                     .get(&row.request_id)
@@ -71,7 +71,7 @@ impl ContinuousBatchScheduler {
             .sequences
             .iter()
             .zip(argmax)
-            .map(|(row, &token)| if row.samples_token { token } else { NO_TOKEN })
+            .map(|(row, &token)| if self.samples_token(row) { token } else { NO_TOKEN })
             .collect();
         if self.batch_requires_logits(batch_id)? {
             return Err(ContinuousBatchError(
@@ -143,7 +143,7 @@ impl ContinuousBatchScheduler {
                     sequence.request_id.0
                 )));
             }
-            if !sequence.samples_token {
+            if !self.samples_token(sequence) {
                 tokens.push(NO_TOKEN);
                 continue;
             }

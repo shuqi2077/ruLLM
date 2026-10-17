@@ -610,7 +610,6 @@ mod tests {
             token_ids: vec![1; count],
             block_table: table.iter().map(|&p| KvPageId(p)).collect(),
             reservation_id: KvReservationId(id),
-            samples_token: true,
         }
     }
     fn tensor(v: Vec<f32>, b: usize, s: usize) -> Tensor<Host, 4> {

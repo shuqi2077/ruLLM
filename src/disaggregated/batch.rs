@@ -28,7 +28,7 @@ pub(super) fn prefill<B:Backend,M:PrefixBatchModel<B>>(model:&M,device:&B::Devic
         let reservation=manager.begin_append(id,end-position).map_err(error)?;
         let batch=ScheduledBatch{id:batch_id,kind:ScheduledBatchKind::Prefill,sequences:vec![ScheduledSequence {
             request_id:id,token_ids:tokens[position..end].to_vec(),start_position:position,context_length:end,
-            block_table:reservation.block_table,reservation_id:reservation.id,samples_token:end==tokens.len(),
+            block_table:reservation.block_table,reservation_id:reservation.id,
         }]};
         let result=model.forward_batch(&batch,&mut cache,device);
         model.sync_batch(device)?;
