@@ -273,7 +273,7 @@ fn paged_qkv_rope_writes_rotated_query_and_paged_kv() {
             &key_pool.client, &key_pool.device, &table, stride, &starts_u32, &contexts, block_size, s,
         ).unwrap();
         let query = paged_qkv_rope(projected_tensor, frequency_tensor, &key_pool, &value_pool,
-            &batch, hq, hkv, d, half_split)
+            &batch, hq, hkv, d, half_split, false)
             .into_data().to_vec::<f32>().unwrap();
         let read = |tensor: &RudaTensor<_>| {
             Tensor::<TB, 4>::from_primitive(TensorPrimitive::Float(tensor.clone()))
