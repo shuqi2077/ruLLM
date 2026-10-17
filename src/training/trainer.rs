@@ -174,7 +174,7 @@ impl<B: AutodiffBackend> ModuleVisitor<B> for ScaleGradients<'_, B> {
 }
 
 /// Global L2 norm of `grads` over `module`; clips in place when above `max`.
-fn clip_global_norm<B: AutodiffBackend, M: AutodiffModule<B>>(
+pub(super) fn clip_global_norm<B: AutodiffBackend, M: AutodiffModule<B>>(
     module: &M,
     grads: &mut GradientsParams,
     max: Option<f32>,
@@ -213,7 +213,7 @@ type LoraOptimizer<B> = OptimizerAdaptor<AdamW, LlamaLora<B>, B>;
 /// which turns FP32 LoRA adapters (and FP32 master weights) on a BF16 backend
 /// into BF16 and breaks resume. Visiting the module directly also avoids the
 /// non-leaf `require_grad` failure of loading records into autodiff modules.
-fn save_trainable<B: ruda_tensor::api::backend::Backend, M: Module<B>>(module: &M, path: &Path) -> Result<(), String> {
+pub(super) fn save_trainable<B: ruda_tensor::api::backend::Backend, M: Module<B>>(module: &M, path: &Path) -> Result<(), String> {
     let mut collector = ParamCollector(Vec::new());
     module.visit(&mut collector);
     super::export::write_safetensors(path, &collector.0, &[("format", "rullm-trainable")])
@@ -221,7 +221,7 @@ fn save_trainable<B: ruda_tensor::api::backend::Backend, M: Module<B>>(module: &
 
 /// Replace every float parameter of `module` (same architecture as when
 /// saved) with the stored value, dtype and `ParamId`, keeping `require_grad`.
-fn load_trainable<B: ruda_tensor::api::backend::Backend, M: Module<B>>(
+pub(super) fn load_trainable<B: ruda_tensor::api::backend::Backend, M: Module<B>>(
     module: &M,
     path: &Path,
     device: &B::Device,
@@ -417,6 +417,63 @@ impl<B: AutodiffBackend + TrainingBackend> SftTrainer<B> {
         self.state
     }
 
+    pub fn device(&self) -> &B::Device { &self.device }
+
+    pub(super) fn objective_contract(&self) -> serde_json::Value {
+        let c = &self.config;
+        serde_json::json!({"peak": c.schedule.peak, "min": c.schedule.min,
+            "warmup": c.schedule.warmup_steps, "steps": c.schedule.total_steps,
+            "weight_decay": c.weight_decay, "beta1": c.beta_1, "beta2": c.beta_2,
+            "epsilon": c.epsilon, "max_grad_norm": c.max_grad_norm,
+            "accumulation": c.gradient_accumulation, "loss_chunk_bytes": c.loss_chunk_bytes})
+    }
+
+    pub(super) fn loss_chunk_rows(&self) -> usize {
+        cross_entropy_chunk_rows(self.vocabulary, self.config.loss_chunk_bytes)
+    }
+
+    pub(super) fn objective_step(&mut self, count: usize, tokens: usize, update_allowed: bool,
+        mut objective: impl FnMut(&PackedLlamaForCausalLm<B>, Option<&LlamaLora<B>>, usize) -> Result<Tensor<B, 1>, TrainError>,
+    ) -> Result<StepStats, TrainError> {
+        if count == 0 { return Err(error("an objective update needs at least one sample")); }
+        let mut sum = 0.0;
+        let mut accumulator = GradientsAccumulator::<PackedLlamaForCausalLm<B>>::new();
+        let mut lora_accumulator = GradientsAccumulator::<LlamaLora<B>>::new();
+        for index in 0..count {
+            let loss = objective(&self.model, self.adapters(), index)?;
+            sum += read_scalar(loss.clone())?;
+            let backward = loss.backward();
+            match &self.trainable {
+                Trainable::Full(_) => accumulator.accumulate::<B>(&self.model,
+                    GradientsParams::from_grads(backward, &self.model)),
+                Trainable::Lora { adapters, .. } => lora_accumulator.accumulate::<B>(adapters,
+                    GradientsParams::from_grads(backward, adapters)),
+            }
+        }
+        let grads = match &self.trainable {
+            Trainable::Full(_) => accumulator.grads(),
+            Trainable::Lora { .. } => lora_accumulator.grads(),
+        };
+        let mut grads = self.synchronize(grads)?;
+        let norm = match &self.trainable {
+            Trainable::Full(_) => clip_global_norm::<B, _>(&self.model, &mut grads, self.config.max_grad_norm)?,
+            Trainable::Lora { adapters, .. } => clip_global_norm::<B, _>(adapters, &mut grads, self.config.max_grad_norm)?,
+        };
+        let learning_rate = self.config.schedule.at(self.state.step);
+        sum = self.objective_mean(sum)?;
+        let allowed = self.objective_mean(if update_allowed { 1.0 } else { 0.0 })?;
+        let applied = norm.is_finite() && sum.is_finite() && allowed == 1.0;
+        if applied {
+            match &mut self.trainable {
+                Trainable::Full(optimizer) => self.model = optimizer.step(learning_rate, self.model.clone(), grads),
+                Trainable::Lora { adapters, optimizer } => *adapters = optimizer.step(learning_rate, adapters.clone(), grads),
+            }
+        } else { self.state.skipped_steps += 1; }
+        self.state.step += 1;
+        self.state.tokens += tokens as u64;
+        Ok(StepStats { step: self.state.step, loss: sum, grad_norm: norm, learning_rate, tokens, applied })
+    }
+
     pub fn model(&self) -> &PackedLlamaForCausalLm<B> {
         &self.model
     }
@@ -426,6 +483,27 @@ impl<B: AutodiffBackend + TrainingBackend> SftTrainer<B> {
             Trainable::Lora { adapters, .. } => Some(adapters),
             Trainable::Full(_) => None,
         }
+    }
+
+    /// Mean local normalization weight; combined with mean-reduced gradients
+    /// this yields a global weighted mean, including unequal replica batches.
+    pub(super) fn objective_normalizer(&self, local: usize) -> Result<f32, TrainError> {
+        let count = self.objective_mean(local as f32)?;
+        if count <= 0.0 { return Err(error("objective has no valid targets")); }
+        Ok(count)
+    }
+
+    pub(super) fn objective_mean(&self, value: f32) -> Result<f32, TrainError> {
+        #[cfg(feature = "distributed")]
+        if let Some(peer) = self.data_parallel {
+            let tensor = Tensor::<B::InnerBackend, 1>::from_data([value], &self.device);
+            let primitive = ruccl::all_reduce::<B::InnerBackend>(peer,
+                tensor.into_primitive().tensor(), ruccl::ReduceOperation::Mean)
+                .map_err(|failure| error(format!("objective reduction failed: {failure:?}")))?;
+            return read_scalar(Tensor::<B::InnerBackend, 1>::from_primitive(
+                ruda_tensor::api::TensorPrimitive::Float(primitive)));
+        }
+        Ok(value)
     }
 
     /// Final model and (for LoRA) adapters.
@@ -474,7 +552,7 @@ impl<B: AutodiffBackend + TrainingBackend> SftTrainer<B> {
     }
 
     #[cfg(feature = "distributed")]
-    fn synchronize(&self, grads: GradientsParams) -> Result<GradientsParams, TrainError> {
+    pub(super) fn synchronize(&self, grads: GradientsParams) -> Result<GradientsParams, TrainError> {
         match self.data_parallel {
             Some(peer) => grads
                 .all_reduce::<B::InnerBackend>(peer, ruccl::ReduceOperation::Mean)
@@ -484,7 +562,7 @@ impl<B: AutodiffBackend + TrainingBackend> SftTrainer<B> {
     }
 
     #[cfg(not(feature = "distributed"))]
-    fn synchronize(&self, grads: GradientsParams) -> Result<GradientsParams, TrainError> {
+    pub(super) fn synchronize(&self, grads: GradientsParams) -> Result<GradientsParams, TrainError> {
         Ok(grads)
     }
 }
@@ -555,7 +633,7 @@ impl<B: AutodiffBackend + TrainingBackend> SftTrainer<B> {
     }
 }
 
-fn read_scalar<B: ruda_tensor::api::backend::Backend>(tensor: Tensor<B, 1>) -> Result<f32, TrainError> {
+pub(super) fn read_scalar<B: ruda_tensor::api::backend::Backend>(tensor: Tensor<B, 1>) -> Result<f32, TrainError> {
     tensor
         .into_data()
         .convert::<f32>()
@@ -578,6 +656,10 @@ impl<B: AutodiffBackend + TrainingBackend> SftTrainer<B> {
     /// delete older checkpoints beyond `keep_checkpoints`. For LoRA only the
     /// adapters are saved; the frozen base is reloaded from its source.
     pub fn save_checkpoint(&mut self) -> Result<PathBuf, TrainError> {
+        self.save_checkpoint_with(|_| Ok(()))
+    }
+
+    pub(super) fn save_checkpoint_with(&mut self, extra: impl FnOnce(&Path) -> Result<(), TrainError>) -> Result<PathBuf, TrainError> {
         let root = &self.config.checkpoint_dir;
         std::fs::create_dir_all(root).map_err(io)?;
         let name = format!("step-{:08}", self.state.step);
@@ -603,6 +685,7 @@ impl<B: AutodiffBackend + TrainingBackend> SftTrainer<B> {
         }
         let state = serde_json::to_vec_pretty(&self.state).map_err(error)?;
         std::fs::write(temporary.join(STATE_FILE), state).map_err(io)?;
+        extra(&temporary)?;
         if destination.exists() {
             std::fs::remove_dir_all(&destination).map_err(io)?;
         }

@@ -23,6 +23,8 @@ use ruda_kernel::tensor::RudaTensor;
 
 pub(crate) mod awq;
 pub(crate) mod rope;
+#[cfg(all(test, feature = "nvidia"))]
+mod paged_rope_tests;
 mod packed_training;
 mod cache_record;
 mod batching;
@@ -1535,6 +1537,7 @@ where
         pools: &[(RudaTensor<R>, RudaTensor<R>)],
         batch: &PagedAttentionBatch<R>,
         all_positions: bool,
+        rotary_tables: &[Option<Tensor<DeviceBackend<R, F, I, BT>, 3>>],
     ) -> Tensor<DeviceBackend<R, F, I, BT>, 3> {
         assert_eq!(pools.len(), self.layers.len(), "one KV pool pair per layer");
         assert_eq!(tokens.dims(), [batch.batch, batch.sequence]);
@@ -1543,8 +1546,8 @@ where
             "paged context exceeds the model's RoPE capacity"
         );
         let mut hidden = self.embed_tokens.forward(tokens);
-        for (layer, (key_pool, value_pool)) in self.layers.iter().zip(pools) {
-            hidden = layer.forward_paged_ruda(hidden, key_pool, value_pool, batch);
+        for ((layer, (key_pool, value_pool)), rotary) in self.layers.iter().zip(pools).zip(rotary_tables) {
+            hidden = layer.forward_paged_ruda(hidden, key_pool, value_pool, batch, rotary.as_ref());
         }
         let [rows, sequence, width] = hidden.dims();
         let hidden = if all_positions {
@@ -1567,7 +1570,6 @@ pub(crate) struct PackedLlamaGeometry {
     pub vocab_size: usize,
     pub max_sequence_length: usize,
     pub dtype: DType,
-    pub paged_rope: bool,
 }
 
 impl<B: Backend> PackedLlamaForCausalLm<B> {
@@ -1581,9 +1583,11 @@ impl<B: Backend> PackedLlamaForCausalLm<B> {
             vocab_size: self.embed_tokens.weight.dims()[0],
             max_sequence_length: self.max_sequence_length,
             dtype: attention.qkv_weight.val().dtype(),
-            paged_rope: self.layers.iter().all(|layer| layer.self_attn.rotary_state.is_none()
-                && layer.self_attn.rope.freq_complex.dims()[1] == layer.self_attn.head_dimension),
         }
+    }
+
+    pub(crate) fn paged_rotary_states(&self) -> Vec<Option<rope::RotaryState>> {
+        self.layers.iter().map(|layer| layer.self_attn.rotary_state.clone()).collect()
     }
 
     /// Adapter shapes for [`crate::LlamaLora::new`].
@@ -1689,6 +1693,25 @@ impl<B: Backend> PackedLlamaForCausalLm<B> {
 }
 
 impl<B: TrainingBackend> PackedLlamaForCausalLm<B> {
+    /// Full-vocabulary selected-token log probabilities, without retaining
+    /// the full token-by-vocabulary projection for backward.
+    pub fn train_log_probs(&self, tokens: Tensor<B, 2, Int>, targets: Tensor<B, 1, Int>,
+        lora: Option<&LlamaLora<B>>, chunk_rows: usize) -> Tensor<B, 1>
+    where B: crate::training::LinearLogProbsBackend {
+        let hidden = self.forward_train_hidden(tokens, lora);
+        let [batch, sequence, width] = hidden.dims();
+        crate::training::linear_log_probs(hidden.reshape([batch * sequence, width]),
+            self.lm_head.weight.val(), targets, chunk_rows)
+    }
+
+    pub(crate) fn train_last_logits(&self, tokens: Tensor<B, 2, Int>,
+        lora: Option<&LlamaLora<B>>) -> Tensor<B, 1> {
+        let hidden = self.forward_train_hidden(tokens, lora);
+        let [_, length, width] = hidden.dims();
+        self.lm_head.forward(hidden.slice([0..1, length-1..length, 0..width]))
+            .reshape([self.geometry().vocab_size])
+    }
+
     /// Final normalized hidden states `[batch, sequence, hidden]` of a full
     /// causal training forward, with optional LoRA adapters. Attention uses
     /// the memory-efficient [`flash_attention`] operator.
@@ -1824,6 +1847,7 @@ where
         key_pool: &RudaTensor<R>,
         value_pool: &RudaTensor<R>,
         batch: &PagedAttentionBatch<R>,
+        rotary: Option<&Tensor<DeviceBackend<R, F, I, BT>, 3>>,
     ) -> Tensor<DeviceBackend<R, F, I, BT>, 3> {
         let residual = input.clone();
         let normalized = ruda_inference::rms_norm(
@@ -1833,7 +1857,7 @@ where
         );
         let attention = self
             .self_attn
-            .forward_paged_ruda(normalized, key_pool, value_pool, batch);
+            .forward_paged_ruda(normalized, key_pool, value_pool, batch, rotary);
         let (hidden, normalized) = ruda_inference::residual_rms_norm(
             residual,
             attention,
@@ -1859,6 +1883,7 @@ where
         key_pool: &RudaTensor<R>,
         value_pool: &RudaTensor<R>,
         batch: &PagedAttentionBatch<R>,
+        rotary: Option<&Tensor<DeviceBackend<R, F, I, BT>, 3>>,
     ) -> Tensor<DeviceBackend<R, F, I, BT>, 3> {
         let [rows, sequence, _] = input.dims();
         let projected = linear(
@@ -1868,14 +1893,15 @@ where
         );
         let query = paged_attention::paged_qkv_rope(
             projected,
-            self.rope.freq_complex.clone(),
+            rotary.cloned().unwrap_or_else(|| self.rope.freq_complex.clone()),
             key_pool,
             value_pool,
             batch,
             self.num_query_heads,
             self.num_kv_heads,
             self.head_dimension,
-            self.rotary_layout == RotaryLayout::HalfSplit,
+            rotary.is_some() || self.rotary_layout == RotaryLayout::HalfSplit,
+            rotary.is_some(),
         );
         let context = paged_attention::paged_attention(
             query,

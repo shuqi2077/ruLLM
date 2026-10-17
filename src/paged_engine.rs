@@ -16,6 +16,8 @@ use ruda_tensor::DeviceOps;
 use ruda_tensor::api::{DType, Int, Tensor, TensorData};
 use ruda_tensor_device::{BoolElement, DeviceBackend, DeviceRuntime, FloatElement, IntElement};
 
+mod rotary;
+
 fn scheduler_error(error: ContinuousBatchError) -> GenerationError {
     GenerationError(error.0)
 }
@@ -25,6 +27,7 @@ pub struct PagedLlamaEngine<R: DeviceRuntime> {
     pools: Vec<(RudaTensor<R>, RudaTensor<R>)>,
     kv: PagedKvCacheConfig,
     geometry: PackedLlamaGeometry,
+    rotary: std::sync::Mutex<rotary::PagedRotaryCache>,
 }
 
 impl<R: DeviceRuntime> core::fmt::Debug for PagedLlamaEngine<R> {
@@ -58,9 +61,6 @@ where
         kv.validate()
             .map_err(|error| GenerationError(error.to_string()))?;
         let geometry = model.geometry();
-        if !geometry.paged_rope {
-            return Err(GenerationError("paged inference requires static full-head RoPE".into()));
-        }
         if kv.max_sequence_length > geometry.max_sequence_length {
             return Err(GenerationError(format!(
                 "paged KV max_sequence_length {} exceeds model capacity {}",
@@ -99,6 +99,8 @@ where
             pools,
             kv,
             geometry,
+            rotary: std::sync::Mutex::new(rotary::PagedRotaryCache::new(
+                &model.paged_rotary_states(), kv.num_pages, kv.block_size)),
         })
     }
 
@@ -184,7 +186,19 @@ where
             TensorData::new(batch.token_matrix(), [rows, sequence]),
             device,
         );
-        Ok(model.forward_paged_ruda(tokens, &self.pools, &metadata, all_positions))
+        let rotary_tables = self.rotary.lock().expect("paged rotary lock")
+            .prepare(&model.paged_rotary_states(), batch, self.geometry.dtype, device)?;
+        Ok(model.forward_paged_ruda(tokens, &self.pools, &metadata, all_positions, &rotary_tables))
+    }
+
+    /// Commit the same accepted input counts as the scheduler. This preserves
+    /// dynamic RoPE across partial speculative acceptance and recomputation.
+    pub fn commit_batch(&self, batch: &ScheduledBatch, cached_tokens: &[usize]) -> Result<(), GenerationError> {
+        self.rotary.lock().expect("paged rotary lock").commit(batch, cached_tokens)
+    }
+
+    pub fn fail_batch(&self, batch_id: u64) {
+        self.rotary.lock().expect("paged rotary lock").rollback(batch_id);
     }
 
     /// Run one scheduled batch and return last-token logits `[rows, vocab]`.
@@ -318,9 +332,9 @@ where
 
     /// Drop a request that is not part of the in-flight batch.
     pub fn cancel(&mut self, request_id: RequestId) -> Result<Vec<i32>, GenerationError> {
-        self.scheduler.cancel(request_id)
-            .map(|request| request.map_or_else(Vec::new, |request| request.generated_token_ids))
-            .map_err(scheduler_error)
+        let request = self.scheduler.cancel(request_id).map_err(scheduler_error)?;
+        self.engine.rotary.lock().expect("paged rotary lock").forget(request_id);
+        Ok(request.map_or_else(Vec::new, |request| request.generated_token_ids))
     }
 
     pub fn engine(&self) -> &PagedLlamaEngine<R> {
@@ -353,6 +367,17 @@ where
         };
         match self.run_batch(model, &batch, device) {
             Ok(selected) => {
+                let counts = batch.sequences.iter().map(|row| {
+                    if batch.kind == ScheduledBatchKind::Verify {
+                        selected.iter().filter(|(id, _)| *id == row.request_id).count()
+                    } else { row.token_ids.len() }
+                }).collect::<Vec<_>>();
+                self.engine.commit_batch(&batch, &counts)?;
+                for row in &batch.sequences {
+                    if self.scheduler.generated_tokens(row.request_id).is_none() {
+                        self.engine.rotary.lock().expect("paged rotary lock").forget(row.request_id);
+                    }
+                }
                 Ok(Some(BatchStepReport {
                     batch_id: batch.id,
                     kind: batch.kind,
@@ -362,6 +387,7 @@ where
                 }))
             }
             Err(error) => {
+                self.engine.fail_batch(batch.id);
                 self.scheduler
                     .fail_batch(batch.id)
                     .map_err(scheduler_error)?;

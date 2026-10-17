@@ -13,6 +13,52 @@ use ruda_tensor_device::cuda::{Cuda, CudaDevice};
 type F32Train = Autodiff<Cuda<f32, i32>>;
 type Bf16Train = Autodiff<Cuda<bf16, i32>>;
 
+#[test]
+fn post_trainers_update_full_lora_and_critic_and_resume_ppo() {
+    type B = F32Train;
+    let device = CudaDevice::default();
+    let model = LlamaForCausalLm::<B>::init_qwen2(&tiny_config(), &device).unwrap().into_packed_training();
+    let directory = std::env::temp_dir().join(format!("rullm-post-training-{}", std::process::id()));
+    let config = TrainConfig::new(8, 1e-3, &directory);
+    let response = Response { prompt: vec![1, 2], completion: vec![3, 4, 5], terminal: true };
+    let rejected = Response { prompt: vec![1, 2], completion: vec![6], terminal: true };
+    for lora in [false, true] {
+        let actor = if lora {
+            SftTrainer::lora(model.clone(), LlamaLora::new(model.lora_shapes(), LoraConfig::default(), &device), config.clone(), device.clone())
+        } else { SftTrainer::full(model.clone(), config.clone(), device.clone()) };
+        let mut trainer = DpoTrainer::new(actor, ReferencePolicy::new(model.clone(), None, "ref".into()).unwrap(), 0.1, 7).unwrap();
+        let stats = trainer.step(&[PreferencePair { chosen: response.clone(), rejected: rejected.clone() }]).unwrap();
+        assert!(stats.applied && stats.grad_norm > 0.0 && stats.loss.is_finite());
+        assert_eq!(stats.step, 1);
+    }
+    let critic = ValueCritic::new(model.clone(), &device);
+    let initial_critic = critic.clone();
+    let mut ppo = PpoTrainer::new(SftTrainer::full(model.clone(), config.clone(), device.clone()), critic,
+        config.clone(), ReferencePolicy::new(model.clone(), None, "ref".into()).unwrap(), PpoConfig::default(), 9).unwrap();
+    let rollout = ppo.prepare_rollout(response.clone(), &[0.0, 0.0, 1.0]).unwrap();
+    let before = ppo.critic.head.weight.val().inner();
+    assert!(ppo.step(&[rollout.clone()]).unwrap().applied);
+    assert!(max_difference(before, ppo.critic.head.weight.val().inner()) > 0.0);
+    ppo.state.data = serde_json::json!({"epoch": 1, "rollout": rollout});
+    let checkpoint = ppo.save_checkpoint().unwrap();
+    let expected_stats = ppo.step(&[rollout.clone()]).unwrap();
+    let expected_actor = ppo.actor.model().layers[0].self_attn.qkv_weight.val().inner();
+    let expected_critic = ppo.critic.head.weight.val().inner();
+    let mut restored = PpoTrainer::new(SftTrainer::full(model.clone(), config.clone(), device.clone()), initial_critic,
+        config.clone(), ReferencePolicy::new(model.clone(), None, "ref".into()).unwrap(), PpoConfig::default(), 0).unwrap();
+    assert_eq!(restored.load_checkpoint(&checkpoint).unwrap(), 1);
+    assert_eq!(restored.state.data["epoch"], 1);
+    let stats = restored.step(&[rollout]).unwrap();
+    assert!((stats.loss - expected_stats.loss).abs() < 1e-6);
+    assert!(max_difference(expected_actor, restored.actor.model().layers[0].self_attn.qkv_weight.val().inner()) < 1e-6);
+    assert!(max_difference(expected_critic, restored.critic.head.weight.val().inner()) < 1e-6);
+    let mut grpo = GrpoTrainer::new(SftTrainer::full(model.clone(), config, device.clone()),
+        ReferencePolicy::new(model, None, "ref".into()).unwrap(), GrpoConfig::default(), 10).unwrap();
+    let group = grpo.prepare_group(vec![response, rejected], &[1.0, 0.0]).unwrap();
+    assert!(grpo.step(&group).unwrap().applied);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
 fn values(count: usize, seed: u64) -> Vec<f32> {
     let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
     (0..count)

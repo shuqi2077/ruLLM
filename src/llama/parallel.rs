@@ -51,7 +51,7 @@ fn load_parallel<B: DistributedBackend>(
         return Err(HuggingFaceLoadError("TP requires distinct nonempty native devices".into()));
     }
     let directory = directory.canonicalize().map_err(|e| HuggingFaceLoadError(e.to_string()))?;
-    let (config, tied, eos_token_ids, rotary) = crate::huggingface::dense_parallel_config(&directory, qwen2)?;
+    let (config, tied, eos_token_ids, rotary, window) = crate::huggingface::dense_parallel_config(&directory, qwen2)?;
     if !config.num_query_heads.is_multiple_of(world) || !config.d_ff.is_multiple_of(world)
         || !(config.num_kv_heads.is_multiple_of(world) || world.is_multiple_of(config.num_kv_heads)) {
         return Err(HuggingFaceLoadError("Llama/Qwen2 TP requires divisible query/FFN shards and compatible KV-head groups".into()));
@@ -66,7 +66,10 @@ fn load_parallel<B: DistributedBackend>(
                 value.into_primitive().tensor(), ReduceOperation::Sum, group.clone(),
             ).resolve()))
         });
-        let (model, report) = loading::load_rank(&directory, &config, &rotary, tied, qwen2, rank, world, device, reduction)?;
+        let (mut model, report) = loading::load_rank(&directory, &config, &rotary, tied, qwen2, rank, world, device, reduction)?;
+        if let Some((window, first_layer)) = window {
+            model.model.set_sliding_window(window, first_layer);
+        }
         ranks.push(model);
         reports.push(report);
     }

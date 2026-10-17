@@ -8,6 +8,8 @@ pub(crate) mod data;
 pub(crate) mod export;
 pub(crate) mod lora;
 pub(crate) mod ops;
+pub(crate) mod log_probs;
+pub mod post_training;
 pub(crate) mod trainer;
 
 pub use data::{
@@ -23,6 +25,9 @@ pub use trainer::{
     LearningRateSchedule, SftTrainer, StepStats, TrainConfig, TrainError, TrainProgress,
     TrainerState,
 };
+pub use log_probs::{LinearLogProbsBackend, linear_log_probs};
+pub use post_training::{DpoTrainer, GrpoTrainer, PpoTrainer, ReferencePolicy, ValueCritic,
+    Response, PreferencePair, PpoConfig, GrpoConfig, PpoRollout, GrpoRollout, PostTrainingState};
 
 #[cfg(all(test, feature = "nvidia"))]
 mod tests;

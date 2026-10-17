@@ -436,16 +436,17 @@ impl<B: Backend> LoadedHuggingFaceQwen2<B> {
 pub(crate) fn dense_parallel_config(
     directory: &Path,
     qwen2: bool,
-) -> Result<(LlamaConfig, bool, Vec<i32>, crate::llama::rope::RopeParameters), HuggingFaceLoadError> {
+) -> Result<(LlamaConfig, bool, Vec<i32>, crate::llama::rope::RopeParameters, Option<(usize, usize)>), HuggingFaceLoadError> {
     let source = read_json(&directory.join(CONFIG_FILE))?;
     let rotary = rope::parameters(&source)?;
+    let window = sliding_window_spec(&source);
     if qwen2 {
         let (config, tied, eos) = convert_qwen2_config(source)?;
         let eos = load_generation_eos_token_ids(directory, config.vocab_size, eos)?;
-        Ok((config, tied, eos, rotary))
+        Ok((config, tied, eos, rotary, window))
     } else {
         let (config, tied, eos) = convert_config(source)?;
-        Ok((config, tied, eos, rotary))
+        Ok((config, tied, eos, rotary, window))
     }
 }
 
@@ -857,6 +858,29 @@ mod tests {
         assert!(expected.contains("layers.23.self_attn.k_proj.bias"));
         assert!(expected.contains("layers.23.self_attn.v_proj.bias"));
         assert!(!expected.contains("lm_head.weight"));
+    }
+
+    #[cfg(feature = "tensor-parallel")]
+    #[test]
+    fn tensor_parallel_config_retains_mistral_and_qwen_window_policy() {
+        let root = std::env::temp_dir().join(format!("rullm-tp-window-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        for (kind, first) in [("mistral", 0), ("qwen2", 7)] {
+            let mut source: serde_json::Value = serde_json::from_str(QWEN_05B_CONFIG).unwrap();
+            source["model_type"] = serde_json::json!(kind);
+            source["architectures"] = serde_json::json!([if kind == "mistral" { "MistralForCausalLM" } else { "Qwen2ForCausalLM" }]);
+            source["sliding_window"] = serde_json::json!(128);
+            source["use_sliding_window"] = serde_json::json!(true);
+            source["max_window_layers"] = serde_json::json!(first);
+            std::fs::write(root.join("config.json"), serde_json::to_vec(&source).unwrap()).unwrap();
+            assert_eq!(dense_parallel_config(&root, kind == "qwen2").unwrap().4, Some((128, first)));
+            if kind == "qwen2" {
+                source["use_sliding_window"] = serde_json::json!(false);
+                std::fs::write(root.join("config.json"), serde_json::to_vec(&source).unwrap()).unwrap();
+                assert_eq!(dense_parallel_config(&root, true).unwrap().4, None);
+            }
+        }
+        std::fs::remove_file(root.join("config.json")).unwrap(); std::fs::remove_dir(root).unwrap();
     }
 
     #[test]

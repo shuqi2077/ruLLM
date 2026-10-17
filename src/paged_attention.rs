@@ -88,15 +88,18 @@ fn rotary_value<F: Float>(
     column_base: usize,
     dimension: usize,
     frequency_row: usize,
-    #[comptime] head_dim: usize,
+    #[comptime] rotary_dim: usize,
     #[comptime] half_split: bool,
 ) -> F {
     let source = row + (column_base + dimension) * projected.stride(2);
+    if dimension >= rotary_dim {
+        return projected[source];
+    }
     let mut paired_dimension = 0usize;
     let mut frequency_index = dimension;
     let mut negate = false;
     if half_split {
-        let half = comptime!(head_dim / 2);
+        let half = comptime!(rotary_dim / 2);
         frequency_index = 2 * (dimension % half);
         if dimension < half {
             paired_dimension = dimension + half;
@@ -141,7 +144,9 @@ fn paged_qkv_rope_kernel<F: Float>(
     block_size: u32,
     table_stride: u32,
     #[comptime] head_dim: usize,
+    #[comptime] rotary_dim: usize,
     #[comptime] half_split: bool,
+    #[comptime] per_token: bool,
     #[define(F)] _dtype: StorageType,
 ) {
     let sequence = sequence as usize;
@@ -166,14 +171,15 @@ fn paged_qkv_rope_kernel<F: Float>(
         let batch = position / head_dim / query_heads / sequence;
         let row = batch * projected.stride(0) + token * projected.stride(1);
         let absolute = start_positions[batch] as usize + token;
+        let frequency_row = if per_token { batch * sequence + token } else { absolute };
         query[position] = rotary_value::<F>(
             projected,
             frequencies,
             row,
             head * head_dim,
             dimension,
-            absolute,
-            head_dim,
+            frequency_row,
+            rotary_dim,
             half_split,
         );
     } else {
@@ -189,6 +195,7 @@ fn paged_qkv_rope_kernel<F: Float>(
         let batch = local / head_dim / kv_heads / sequence;
         let row = batch * projected.stride(0) + token * projected.stride(1);
         let absolute = start_positions[batch] as usize + token;
+        let frequency_row = if per_token { batch * sequence + token } else { absolute };
         let page = block_table[batch * table_stride + absolute / block_size] as usize;
         let slot = ((page * kv_heads + head) * block_size + absolute % block_size) * head_dim
             + dimension;
@@ -203,8 +210,8 @@ fn paged_qkv_rope_kernel<F: Float>(
                 row,
                 query_width + head * head_dim,
                 dimension,
-                absolute,
-                head_dim,
+                frequency_row,
+                rotary_dim,
                 half_split,
             );
         }
@@ -1100,6 +1107,7 @@ pub(crate) fn paged_qkv_rope<R, F, I, BT>(
     kv_heads: usize,
     head_dim: usize,
     half_split: bool,
+    per_token: bool,
 ) -> Tensor<DeviceBackend<R, F, I, BT>, 4>
 where
     R: DeviceRuntime,
@@ -1122,10 +1130,11 @@ where
     assert_eq!(width, (query_heads + 2 * kv_heads) * head_dim);
     assert!(head_dim.is_multiple_of(2), "RoPE needs an even head width");
     assert!(
-        batch.max_context <= frequencies.meta.shape()[0],
+        (if per_token { batch_size * sequence } else { batch.max_context }) <= frequencies.meta.shape()[0],
         "paged context exceeds the RoPE table"
     );
-    assert_eq!(frequencies.meta.shape()[1], head_dim);
+    let rotary_dim = frequencies.meta.shape()[1];
+    assert!(rotary_dim > 0 && rotary_dim <= head_dim && rotary_dim.is_multiple_of(2));
     assert_eq!(frequencies.meta.shape()[2], 2);
     assert_eq!(key_pool.dtype, projected.dtype);
     assert_eq!(value_pool.dtype, projected.dtype);
@@ -1158,7 +1167,9 @@ where
         batch.block_size as u32,
         batch.table_stride as u32,
         head_dim,
+        rotary_dim,
         half_split,
+        per_token,
         dtype.into(),
     );
     Tensor::from_primitive(TensorPrimitive::Float(query))

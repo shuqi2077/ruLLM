@@ -180,6 +180,34 @@ impl RopeParameters {
 }
 
 impl RotaryState {
+    pub(crate) fn paged_context(&self, previous: Option<usize>, end: usize) -> usize {
+        let state = match self.parameters.scaling {
+            RopeScaling::Dynamic { .. } => self.parameters.state_at(previous.unwrap_or(
+                self.parameters.initial_cached_length())).expect("valid paged rotary history"),
+            _ => self.fresh(),
+        };
+        state.frequencies(end);
+        if matches!(self.parameters.scaling, RopeScaling::Dynamic { .. }) {
+            state.cached_length()
+        } else { end }
+    }
+
+    pub(crate) fn paged_table<B: Backend>(&self, start: usize, contexts: &[usize],
+        dtype: DType, device: &B::Device) -> Tensor<B, 3> {
+        let half = self.parameters.inverse_frequencies.len();
+        let count = contexts.len();
+        let inverse = contexts.iter().flat_map(|&context| self.fresh().frequencies(context))
+            .collect::<Vec<_>>();
+        let positions = Tensor::<B, 2>::from_data(TensorData::new(
+            (start..start + count).map(|p| p as f32).collect::<Vec<_>>(), [count, 1]), (device, DType::F32));
+        let angles = positions * Tensor::<B, 2>::from_data(
+            TensorData::new(inverse, [count, half]), (device, DType::F32));
+        let cos = angles.clone().cos() * self.parameters.attention_factor;
+        let sin = angles.sin() * self.parameters.attention_factor;
+        Tensor::cat(vec![cos, sin], 1).reshape([count, 2, half]).transpose()
+            .unsqueeze_dim::<4>(2).repeat_dim(2, 2).reshape([count, 2 * half, 2]).cast(dtype)
+    }
+
     pub(crate) fn fresh(&self) -> Self { self.parameters.state() }
     pub(crate) fn for_cache(&self, history: &RotaryHistory, position: usize) -> Result<Self, crate::GenerationError> {
         history.validate(position)?;
