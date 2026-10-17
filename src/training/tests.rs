@@ -61,17 +61,17 @@ fn paged_policy_batch_captures_behavior_probabilities_and_uses_fresh_actor_snaps
     assert_eq!(first.len(), 2);
     for (response, prompt) in first.iter().zip(&prompts) {
         assert_eq!(&response.prompt, prompt);
-        assert_eq!(response.behavior_log_probs.as_ref().unwrap().len(), 3);
-        assert_eq!(response.rotary_context.as_ref().unwrap().len(), prompt.len()+3);
+        assert_eq!(response.behavior_log_probs.len(), 3);
+        assert_eq!(response.rotary_context.len(), prompt.len()+3);
     }
     let rewards = vec![vec![0.0, 0.0, 1.0], vec![0.0, 0.0, -0.5]];
     let fixed = trainer.prepare_rollouts(first.clone(), &rewards).unwrap();
     for (rollout, response) in fixed.iter().zip(&first) {
-        assert_eq!(&rollout.old_log_probs, response.behavior_log_probs.as_ref().unwrap());
+        assert_eq!(&rollout.old_log_probs, &response.behavior_log_probs);
     }
     trainer.state = seed.clone();
     assert_eq!(trainer.sample_paged(&prompts, 3, &[], batching, kv).unwrap(), first);
-    assert!(trainer.step(&fixed).unwrap().applied);
+    assert!(trainer.step_paged(&fixed).unwrap().applied);
     trainer.state = seed;
     let updated = trainer.sample_paged(&prompts, 3, &[], batching, kv).unwrap();
     assert!(updated.iter().zip(&first).any(|(a, b)| a.behavior_log_probs != b.behavior_log_probs));
@@ -84,8 +84,8 @@ fn reward_trainer_updates_full_or_lora_and_head_and_resumes_joint_optimizer() {
     let model = LlamaForCausalLm::<B>::init_qwen2(&tiny_config(), &device).unwrap().into_packed_training();
     let directory = std::env::temp_dir().join(format!("rullm-reward-{}", std::process::id()));
     let pair = PreferencePair {
-        chosen: Response { prompt: vec![1, 2], completion: vec![3, 4, 5], terminal: true, rotary_context: None, behavior_log_probs: None },
-        rejected: Response { prompt: vec![1, 2], completion: vec![6], terminal: true, rotary_context: None, behavior_log_probs: None },
+        chosen: Response { prompt: vec![1, 2], completion: vec![3, 4, 5], terminal: true },
+        rejected: Response { prompt: vec![1, 2], completion: vec![6], terminal: true },
     };
     for lora in [false, true] {
         let config = TrainConfig::new(8, 1e-3, directory.join(if lora { "lora" } else { "full" }));
@@ -130,8 +130,8 @@ fn post_trainers_update_full_lora_and_critic_and_resume_ppo() {
     let model = LlamaForCausalLm::<B>::init_qwen2(&tiny_config(), &device).unwrap().into_packed_training();
     let directory = std::env::temp_dir().join(format!("rullm-post-training-{}", std::process::id()));
     let config = TrainConfig::new(8, 1e-3, &directory);
-    let response = Response { prompt: vec![1, 2], completion: vec![3, 4, 5], terminal: true, rotary_context: None, behavior_log_probs: None };
-    let rejected = Response { prompt: vec![1, 2], completion: vec![6], terminal: true, rotary_context: None, behavior_log_probs: None };
+    let response = Response { prompt: vec![1, 2], completion: vec![3, 4, 5], terminal: true };
+    let rejected = Response { prompt: vec![1, 2], completion: vec![6], terminal: true };
     for lora in [false, true] {
         let actor = if lora {
             SftTrainer::lora(model.clone(), LlamaLora::new(model.lora_shapes(), LoraConfig::default(), &device), config.clone(), device.clone())

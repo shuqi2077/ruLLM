@@ -34,15 +34,54 @@ pub struct Response {
     pub prompt: Vec<i32>,
     pub completion: Vec<i32>,
     pub terminal: bool,
-    /// Actual paged append end for each prompt/completion token. None denotes
-    /// the original full-prefix scoring contract. Includes the last token's
-    /// hypothetical append when generation stops before it enters KV.
-    #[serde(default)]
-    pub rotary_context: Option<Vec<usize>>,
-    /// Captured from the sampling engine, not reconstructed from rounded or
-    /// newly updated weights. Used only for old-policy rollout statistics.
-    #[serde(default)]
-    pub behavior_log_probs: Option<Vec<f32>>,
+}
+
+/// Paged sampling metadata is separate so existing Response struct literals
+/// and serialized response/rollout contracts remain valid without new fields.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PagedResponse {
+    pub response: Response,
+    pub rotary_context: Vec<usize>,
+    pub behavior_log_probs: Vec<f32>,
+}
+
+impl core::ops::Deref for PagedResponse {
+    type Target = Response;
+    fn deref(&self) -> &Response { &self.response }
+}
+
+pub trait ResponseRecord: Clone {
+    fn response(&self) -> &Response;
+    fn rotary_context(&self) -> Option<&[usize]> { None }
+    fn behavior_log_probs(&self) -> Option<&[f32]> { None }
+
+    fn validate<B: Backend>(&self, model: &PackedLlamaForCausalLm<B>) -> Result<(), TrainError> {
+        let response = self.response();
+        response.validate(model)?;
+        if let Some(contexts) = self.rotary_context() {
+            let length = response.prompt.len() + response.completion.len();
+            if contexts.len() != length || contexts.iter().enumerate()
+                .any(|(position, &end)| end <= position || end > length)
+                || contexts.windows(2).any(|pair| pair[0] > pair[1]) {
+                return Err(err("response rotary append contexts do not cover its actual tokens"));
+            }
+        }
+        if self.behavior_log_probs().is_some_and(|values| values.len() != response.completion.len()
+            || values.iter().any(|x| !x.is_finite() || *x > 0.0)) {
+            return Err(err("behavior log probabilities must match completion tokens"));
+        }
+        Ok(())
+    }
+}
+
+impl ResponseRecord for Response {
+    fn response(&self) -> &Response { self }
+}
+
+impl ResponseRecord for PagedResponse {
+    fn response(&self) -> &Response { &self.response }
+    fn rotary_context(&self) -> Option<&[usize]> { Some(&self.rotary_context) }
+    fn behavior_log_probs(&self) -> Option<&[f32]> { Some(&self.behavior_log_probs) }
 }
 
 impl Response {
@@ -61,18 +100,6 @@ impl Response {
                 "response needs nonempty prompt/completion within model context and vocabulary",
             ));
         }
-        if let Some(contexts) = &self.rotary_context {
-            let length = self.prompt.len() + self.completion.len();
-            if contexts.len() != length || contexts.iter().enumerate()
-                .any(|(position, &end)| end <= position || end > length)
-                || contexts.windows(2).any(|pair| pair[0] > pair[1]) {
-                return Err(err("response rotary append contexts do not cover its actual tokens"));
-            }
-        }
-        if self.behavior_log_probs.as_ref().is_some_and(|values| values.len() != self.completion.len()
-            || values.iter().any(|x| !x.is_finite() || *x > 0.0)) {
-            return Err(err("behavior log probabilities must match completion tokens"));
-        }
         Ok(())
     }
     pub(super) fn inputs<B: Backend>(&self, device: &B::Device, include_last: bool) -> Tensor<B, 2, Int> {
@@ -87,9 +114,9 @@ impl Response {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct PreferencePair {
-    pub chosen: Response,
-    pub rejected: Response,
+pub struct PreferencePair<R = Response> {
+    pub chosen: R,
+    pub rejected: R,
 }
 
 /// Explicit, immutable reference, which may itself contain frozen adapters.
@@ -115,16 +142,17 @@ impl<B: Backend> ReferencePolicy<B> {
     }
 }
 
-fn probabilities<B: TrainingBackend + LinearLogProbsBackend>(
+fn probabilities<B: TrainingBackend + LinearLogProbsBackend, R: ResponseRecord>(
     model: &PackedLlamaForCausalLm<B>,
     adapters: Option<&LlamaLora<B>>,
-    response: &Response,
+    response: &R,
     device: &B::Device,
     chunk: usize,
 ) -> Tensor<B, 1> {
-    if response.rotary_context.is_some() {
+    if response.rotary_context().is_some() {
         return probabilities_many(model, adapters, &[response], device, chunk).remove(0);
     }
+    let response = response.response();
     // Runtime RoPE depends on the append context. Score each action on the
     // very prefix used by the categorical sampler, not the final response's
     // longer rotary context (which would change the old-policy distribution).
@@ -306,8 +334,6 @@ fn sample<B: AutodiffBackend + TrainingBackend>(
         prompt: prompt.to_vec(),
         completion: tokens[prompt.len()..].to_vec(),
         terminal,
-        rotary_context: None,
-        behavior_log_probs: None,
     })
 }
 
@@ -337,13 +363,21 @@ impl<B: AutodiffBackend + TrainingBackend + LinearLogProbsBackend> DpoTrainer<B>
     /// One effective-batch update; chosen/rejected likelihoods are completion
     /// sums and every preference pair has equal weight, independent of length.
     pub fn step(&mut self, pairs: &[PreferencePair]) -> Result<StepStats, TrainError> {
+        self.step_responses(pairs)
+    }
+
+    pub fn step_paged(&mut self, pairs: &[PreferencePair<PagedResponse>]) -> Result<StepStats, TrainError> {
+        self.step_responses(pairs)
+    }
+
+    fn step_responses<R: ResponseRecord>(&mut self, pairs: &[PreferencePair<R>]) -> Result<StepStats, TrainError> {
         if pairs.is_empty() { return Err(err("DPO requires a nonempty local preference batch")); }
         for pair in pairs {
             pair.chosen.validate(self.actor.model())?;
             pair.rejected.validate(self.actor.model())?;
             pair.chosen.validate(&self.reference.model)?;
             pair.rejected.validate(&self.reference.model)?;
-            if pair.chosen.prompt != pair.rejected.prompt {
+            if pair.chosen.response().prompt != pair.rejected.response().prompt {
                 return Err(err("DPO pair prompts differ"));
             }
         }
@@ -354,7 +388,7 @@ impl<B: AutodiffBackend + TrainingBackend + LinearLogProbsBackend> DpoTrainer<B>
         let beta = self.beta;
         let tokens = pairs
             .iter()
-            .map(|p| p.chosen.completion.len() + p.rejected.completion.len())
+            .map(|p| p.chosen.response().completion.len() + p.rejected.response().completion.len())
             .sum();
         let responses: Vec<_> = pairs.iter().map(|p| &p.chosen)
             .chain(pairs.iter().map(|p| &p.rejected)).collect();
@@ -413,10 +447,11 @@ impl<B: TrainingBackend> ValueCritic<B> {
             head: LinearConfig::new(width, 1).init(device),
         }
     }
-    fn response_values(&self, response: &Response, device: &B::Device) -> Tensor<B, 1> {
-        if response.rotary_context.is_some() {
+    fn response_values<R: ResponseRecord>(&self, response: &R, device: &B::Device) -> Tensor<B, 1> {
+        if response.rotary_context().is_some() {
             return critic_many(self, &[response], device).remove(0);
         }
+        let response = response.response();
         if self
             .backbone
             .paged_rotary_states()
@@ -501,17 +536,17 @@ impl PpoConfig {
 /// Fixed rollout-policy statistics. Reuse this same object for all PPO epochs;
 /// recomputing old probabilities after updates would invalidate clipping.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct PpoRollout {
-    pub response: Response,
+pub struct PpoRollout<R = Response> {
+    pub response: R,
     pub old_log_probs: Vec<f32>,
     pub old_values: Vec<f32>,
     pub advantages: Vec<f32>,
     pub returns: Vec<f32>,
 }
-impl PpoRollout {
+impl<R: ResponseRecord> PpoRollout<R> {
     fn validate<B: Backend>(&self, model: &PackedLlamaForCausalLm<B>) -> Result<(), TrainError> {
         self.response.validate(model)?;
-        let n = self.response.completion.len();
+        let n = self.response.response().completion.len();
         if [
             &self.old_log_probs,
             &self.old_values,
@@ -589,16 +624,13 @@ impl<B: AutodiffBackend + TrainingBackend + LinearLogProbsBackend> PpoTrainer<B>
         }
         let device = self.actor.device();
         let chunk = self.actor.loss_chunk_rows();
-        let old = match &response.behavior_log_probs {
-            Some(logp) => logp.clone(),
-            None => values(probabilities(
+        let old = values(probabilities(
             &self.actor.model().clone().no_grad(),
             self.actor.adapters().cloned().map(Module::no_grad).as_ref(),
             &response,
             device,
             chunk,
-        ))?,
-        };
+        ))?;
         let reference = values(probabilities(
             &self.reference.model,
             self.reference.adapters.as_ref(),
@@ -638,13 +670,21 @@ impl<B: AutodiffBackend + TrainingBackend + LinearLogProbsBackend> PpoTrainer<B>
     }
     /// Token-mean clipped policy/value losses over the entire effective batch.
     pub fn step(&mut self, rollouts: &[PpoRollout]) -> Result<StepStats, TrainError> {
+        self.step_responses(rollouts)
+    }
+
+    pub fn step_paged(&mut self, rollouts: &[PpoRollout<PagedResponse>]) -> Result<StepStats, TrainError> {
+        self.step_responses(rollouts)
+    }
+
+    fn step_responses<R: ResponseRecord>(&mut self, rollouts: &[PpoRollout<R>]) -> Result<StepStats, TrainError> {
         if rollouts.is_empty() { return Err(err("PPO requires a nonempty local rollout batch")); }
         self.config.validate()?;
         for rollout in rollouts {
             rollout.validate(self.actor.model())?;
             rollout.response.validate(&self.critic.backbone)?;
         }
-        let tokens: usize = rollouts.iter().map(|r| r.response.completion.len()).sum();
+        let tokens: usize = rollouts.iter().map(|r| r.response.response().completion.len()).sum();
         let normalizer = self.actor.objective_normalizer(tokens)?;
         let device = self.actor.device().clone();
         let chunk = self.actor.loss_chunk_rows();
@@ -652,7 +692,7 @@ impl<B: AutodiffBackend + TrainingBackend + LinearLogProbsBackend> PpoTrainer<B>
         let predicted = critic_many(&self.critic, &responses, &device);
         let mut critic_losses = Vec::new();
         for (rollout, predicted) in rollouts.iter().zip(predicted) {
-            let n = rollout.response.completion.len();
+            let n = rollout.response.response().completion.len();
             let predicted = predicted.slice([0..n]);
             let target = vector(&rollout.returns, &device);
             let loss = (predicted.clone() - target.clone()).square();
@@ -793,8 +833,8 @@ impl GrpoConfig {
     }
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct GrpoRollout {
-    pub response: Response,
+pub struct GrpoRollout<R = Response> {
+    pub response: R,
     pub old_log_probs: Vec<f32>,
     pub reference_log_probs: Vec<f32>,
     pub advantage: f32,
@@ -835,11 +875,21 @@ impl<B: AutodiffBackend + TrainingBackend + LinearLogProbsBackend> GrpoTrainer<B
         responses: Vec<Response>,
         rewards: &[f32],
     ) -> Result<Vec<GrpoRollout>, TrainError> {
+        self.prepare_responses(responses, rewards)
+    }
+
+    pub fn prepare_paged_group(&self, responses: Vec<PagedResponse>, rewards: &[f32])
+        -> Result<Vec<GrpoRollout<PagedResponse>>, TrainError> {
+        self.prepare_responses(responses, rewards)
+    }
+
+    fn prepare_responses<R: ResponseRecord>(&self, responses: Vec<R>, rewards: &[f32])
+        -> Result<Vec<GrpoRollout<R>>, TrainError> {
         self.config.validate()?;
         if responses.len() < 2
             || responses.len() != rewards.len()
             || rewards.iter().any(|x| !x.is_finite())
-            || responses.iter().any(|r| r.prompt != responses[0].prompt)
+            || responses.iter().any(|r| r.response().prompt != responses[0].response().prompt)
         {
             return Err(err(
                 "GRPO requires a complete same-prompt group and finite rewards",
@@ -876,13 +926,21 @@ impl<B: AutodiffBackend + TrainingBackend + LinearLogProbsBackend> GrpoTrainer<B
     }
     /// Mean of per-response token means, not a length-biased global token mean.
     pub fn step(&mut self, rollouts: &[GrpoRollout]) -> Result<StepStats, TrainError> {
+        self.step_responses(rollouts)
+    }
+
+    pub fn step_paged(&mut self, rollouts: &[GrpoRollout<PagedResponse>]) -> Result<StepStats, TrainError> {
+        self.step_responses(rollouts)
+    }
+
+    fn step_responses<R: ResponseRecord>(&mut self, rollouts: &[GrpoRollout<R>]) -> Result<StepStats, TrainError> {
         if rollouts.is_empty() { return Err(err("GRPO requires a nonempty local rollout batch")); }
         self.config.validate()?;
         for r in rollouts {
             r.response.validate(self.actor.model())?;
             if !r.advantage.is_finite()
                 || [&r.old_log_probs, &r.reference_log_probs].iter().any(|v| {
-                    v.len() != r.response.completion.len() || v.iter().any(|x| !x.is_finite())
+                    v.len() != r.response.response().completion.len() || v.iter().any(|x| !x.is_finite())
                 })
             {
                 return Err(err("invalid fixed GRPO rollout statistics"));
@@ -892,7 +950,7 @@ impl<B: AutodiffBackend + TrainingBackend + LinearLogProbsBackend> GrpoTrainer<B
         let device = self.actor.device().clone();
         let chunk = self.actor.loss_chunk_rows();
         let config = &self.config;
-        let tokens = rollouts.iter().map(|r| r.response.completion.len()).sum();
+        let tokens = rollouts.iter().map(|r| r.response.response().completion.len()).sum();
         let responses: Vec<_> = rollouts.iter().map(|r| &r.response).collect();
         self.actor
             .objective_step(1, tokens, true, |model, adapters, _| {

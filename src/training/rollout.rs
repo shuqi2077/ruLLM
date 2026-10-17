@@ -1,5 +1,5 @@
 //! Synchronous policy-version batches over the actual paged KV device engine.
-use super::{PostTrainingState, Response, SftTrainer, TrainError, TrainingBackend, PpoTrainer, GrpoTrainer};
+use super::{PostTrainingState, Response, PagedResponse, ResponseRecord, SftTrainer, TrainError, TrainingBackend, PpoTrainer, GrpoTrainer};
 use crate::{ContinuousBatchConfig, ContinuousBatchRunner, PagedKvCacheConfig,
     SamplingConfig, SamplingGenerationConfig, RequestId};
 use ruda::runtime::server::ComputeServer;
@@ -26,8 +26,8 @@ macro_rules! paged_trainer_sampler {
         impl<B: AutodiffBackend + TrainingBackend> $trainer<B> {
             pub fn sample_paged<R, F, I, BT>(&mut self, prompts: &[Vec<i32>], max_new_tokens: usize,
                 eos: &[i32], batching: ContinuousBatchConfig, kv: PagedKvCacheConfig)
-                -> Result<Vec<Response>, TrainError>
-            where B: AutodiffBackend<InnerBackend = DeviceBackend<R, F, I, BT>>,
+                -> Result<Vec<PagedResponse>, TrainError>
+            where B: AutodiffBackend<InnerBackend = DeviceBackend<R, F, I, BT>, Device = R::RudaDevice>,
                 R: DeviceRuntime, R::Server: ComputeServer, R::Device: DeviceOps,
                 F: FloatElement, I: IntElement, BT: BoolElement,
             {
@@ -46,9 +46,9 @@ impl<B: AutodiffBackend + TrainingBackend> SftTrainer<B> {
     /// weights or KV. Caller-controlled rewards and grouping remain unchanged.
     pub fn sample_paged<R, F, I, BT>(&self, prompts: &[Vec<i32>], max_new_tokens: usize,
         eos: &[i32], batching: ContinuousBatchConfig, kv: PagedKvCacheConfig,
-        state: &mut PostTrainingState) -> Result<Vec<Response>, TrainError>
+        state: &mut PostTrainingState) -> Result<Vec<PagedResponse>, TrainError>
     where
-        B: AutodiffBackend<InnerBackend = DeviceBackend<R, F, I, BT>>,
+        B: AutodiffBackend<InnerBackend = DeviceBackend<R, F, I, BT>, Device = R::RudaDevice>,
         R: DeviceRuntime, R::Server: ComputeServer, R::Device: DeviceOps,
         F: FloatElement, I: IntElement, BT: BoolElement,
     {
@@ -88,11 +88,11 @@ impl<B: AutodiffBackend + TrainingBackend> SftTrainer<B> {
         let mut finished = BTreeMap::new();
         while finished.len() < prompts.len() {
             let report = runner.step(&model, self.device()).map_err(failure)?;
-            if let Some(report) = &report {
+            if report.is_some() {
                 for &(id, logp) in runner.selected_log_probs() {
                     probabilities.get_mut(&id).ok_or_else(|| failure("unknown rollout probability"))?.push(logp);
                 }
-                for &(id, start, end) in &report.appended {
+                for &(id, start, end) in runner.appended_ranges() {
                     let history = histories.get_mut(&id).ok_or_else(|| failure("unknown rollout request"))?;
                     history.resize(history.len().max(end), 0);
                     for context in &mut history[start..end] {
@@ -107,9 +107,12 @@ impl<B: AutodiffBackend + TrainingBackend> SftTrainer<B> {
                 let mut contexts = histories.remove(&done.request_id).ok_or_else(|| failure("missing rollout history"))?;
                 contexts.resize(length, length);
                 if contexts.contains(&0) { return Err(failure("incomplete rollout rotary history")); }
-                let response = Response { prompt: done.prompt_token_ids, completion: done.generated_token_ids,
-                    terminal: done.stopped_on_eos, rotary_context: Some(contexts),
-                    behavior_log_probs: probabilities.remove(&done.request_id) };
+                let response = PagedResponse {
+                    response: Response { prompt: done.prompt_token_ids, completion: done.generated_token_ids,
+                        terminal: done.stopped_on_eos },
+                    rotary_context: contexts,
+                    behavior_log_probs: probabilities.remove(&done.request_id)
+                        .ok_or_else(|| failure("missing rollout probabilities"))? };
                 response.validate(self.model())?;
                 finished.insert(done.request_id, response);
             }

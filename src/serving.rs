@@ -73,8 +73,6 @@ pub struct GenerateRequest {
     #[serde(default)]
     pub tool_choice: Option<Value>,
     #[serde(default)]
-    pub parallel_tool_calls: Option<bool>,
-    #[serde(default)]
     pub response_format: Option<structured::ResponseFormat>,
     #[serde(default)]
     pub grammar: Option<structured::Grammar>,
@@ -134,9 +132,12 @@ impl GenerateRequest {
             return Err("completions requires a string prompt and no messages/tools".into());
         }
         for key in self.template_options.keys() {
-            if key != "enable_thinking" {
+            if key != "enable_thinking" && key != "parallel_tool_calls" {
                 return Err(format!("unsupported request field {key}"));
             }
+        }
+        if self.template_options.get("parallel_tool_calls").is_some_and(|value| !value.is_boolean()) {
+            return Err("parallel_tool_calls must be a boolean".into());
         }
         if self
             .template_options
@@ -199,6 +200,10 @@ impl GenerateRequest {
     fn tools_enabled(&self) -> bool {
         self.tool_choice.as_ref().and_then(Value::as_str) != Some("none")
             && self.tools.as_ref().is_some_and(|t| !t.is_empty())
+    }
+
+    fn parallel_tool_calls(&self) -> Option<bool> {
+        self.template_options.get("parallel_tool_calls").and_then(Value::as_bool)
     }
 }
 
@@ -859,7 +864,7 @@ fn finish_response(
     {
         return Err("model finished without the required tool call".into());
     }
-    if job.request.parallel_tool_calls == Some(false) && calls.len() > 1 {
+    if job.request.parallel_tool_calls() == Some(false) && calls.len() > 1 {
         return Err("model emitted multiple calls with parallel_tool_calls=false".into());
     }
     if let Some(name) = job

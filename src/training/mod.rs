@@ -30,7 +30,7 @@ pub use trainer::{
 pub use log_probs::{LinearLogProbsBackend, linear_log_probs};
 pub use reward::RewardTrainer;
 pub use post_training::{DpoTrainer, GrpoTrainer, PpoTrainer, ReferencePolicy, ValueCritic,
-    Response, PreferencePair, PpoConfig, GrpoConfig, PpoRollout, GrpoRollout, PostTrainingState};
+    Response, PagedResponse, ResponseRecord, PreferencePair, PpoConfig, GrpoConfig, PpoRollout, GrpoRollout, PostTrainingState};
 
 #[cfg(all(test, feature = "nvidia"))]
 mod tests;

@@ -10,32 +10,33 @@ pub(super) struct ResponseLayout {
 }
 
 impl ResponseLayout {
-    pub fn new(responses: &[&Response], include_last: bool) -> Self {
+    pub fn new<R: ResponseRecord>(responses: &[&R], include_last: bool) -> Self {
         let mut tokens = Vec::new();
         let mut targets = Vec::new();
         let mut boundaries = vec![0];
         let mut actions = Vec::new();
         let mut contexts = Vec::new();
         for response in responses {
+            let source = response.response();
             let offset = tokens.len();
-            tokens.extend(&response.prompt);
-            tokens.extend(&response.completion);
+            tokens.extend(&source.prompt);
+            tokens.extend(&source.completion);
             if !include_last { tokens.pop(); }
             let length = tokens.len() - offset;
-            match &response.rotary_context {
+            match response.rotary_context() {
                 Some(history) => contexts.extend_from_slice(&history[..length]),
                 None => contexts.extend(core::iter::repeat_n(length, length)),
             }
-            let start = offset + response.prompt.len() - 1;
-            let end = start + response.completion.len();
+            let start = offset + source.prompt.len() - 1;
+            let end = start + source.completion.len();
             targets.resize(start, -100);
-            targets.extend(&response.completion);
+            targets.extend(&source.completion);
             targets.resize(tokens.len(), -100);
             actions.push(start..end + usize::from(include_last));
             boundaries.push(tokens.len());
         }
         let layout = PackedSequenceLayout::new(boundaries, tokens.len());
-        let append_contexts = responses.iter().any(|r| r.rotary_context.is_some()).then_some(contexts);
+        let append_contexts = responses.iter().any(|r| r.rotary_context().is_some()).then_some(contexts);
         Self { tokens, targets, layout, actions, append_contexts }
     }
 
@@ -45,11 +46,11 @@ impl ResponseLayout {
 }
 
 /// Each vector contains only the actions of one response, in input order.
-pub(super) fn probabilities_many<B: TrainingBackend + LinearLogProbsBackend>(
+pub(super) fn probabilities_many<B: TrainingBackend + LinearLogProbsBackend, R: ResponseRecord>(
     model: &PackedLlamaForCausalLm<B>, adapters: Option<&LlamaLora<B>>,
-    responses: &[&Response], device: &B::Device, chunk: usize,
+    responses: &[&R], device: &B::Device, chunk: usize,
 ) -> Vec<Tensor<B, 1>> {
-    if model.paged_rotary_states().iter().any(Option::is_some) && responses.iter().any(|r| r.rotary_context.is_none()) {
+    if model.paged_rotary_states().iter().any(Option::is_some) && responses.iter().any(|r| r.rotary_context().is_none()) {
         return prefix_statistics(model, adapters, responses, device, chunk);
     }
     let batch = ResponseLayout::new(responses, false);
@@ -59,22 +60,23 @@ pub(super) fn probabilities_many<B: TrainingBackend + LinearLogProbsBackend>(
     batch.actions.into_iter().map(|range| logp.clone().slice([range])).collect()
 }
 
-pub(super) fn critic_many<B: TrainingBackend>(critic: &ValueCritic<B>, responses: &[&Response],
+pub(super) fn critic_many<B: TrainingBackend, R: ResponseRecord>(critic: &ValueCritic<B>, responses: &[&R],
     device: &B::Device) -> Vec<Tensor<B, 1>> {
     // The critic does not need an LM projection or LinearLogProbsBackend.
-    if critic.backbone.paged_rotary_states().iter().any(Option::is_some) && responses.iter().any(|r| r.rotary_context.is_none()) {
+    if critic.backbone.paged_rotary_states().iter().any(Option::is_some) && responses.iter().any(|r| r.rotary_context().is_none()) {
         let mut selected: Vec<Vec<Tensor<B, 1>>> = responses.iter().map(|_| Vec::new()).collect();
-        let maximum = responses.iter().map(|r| r.completion.len()).max().unwrap_or(0);
+        let maximum = responses.iter().map(|r| r.response().completion.len()).max().unwrap_or(0);
         for step in 0..=maximum {
-            let active: Vec<_> = responses.iter().enumerate().filter(|(_, r)| step <= r.completion.len()).collect();
-            let mut tokens = Vec::new();
+            let active: Vec<_> = responses.iter().enumerate().filter(|(_, r)| step <= r.response().completion.len()).collect();
+            let mut tokens: Vec<i32> = Vec::new();
             let mut contexts = Vec::new();
             let mut boundaries = vec![0];
             for (_, response) in &active {
-                tokens.extend(&response.prompt);
-                tokens.extend(&response.completion[..step]);
-                let length = response.prompt.len() + step;
-                contexts.extend(response.rotary_context.as_ref().map(|v| v[..length].to_vec())
+                let source = response.response();
+                tokens.extend(&source.prompt);
+                tokens.extend(&source.completion[..step]);
+                let length = source.prompt.len() + step;
+                contexts.extend(response.rotary_context().map(|v| v[..length].to_vec())
                     .unwrap_or_else(|| vec![length; length]));
                 boundaries.push(tokens.len());
             }
@@ -96,12 +98,12 @@ pub(super) fn critic_many<B: TrainingBackend>(critic: &ValueCritic<B>, responses
     batch.actions.into_iter().map(|range| values.clone().slice([range])).collect()
 }
 
-pub(super) fn behavior_many<B: TrainingBackend + LinearLogProbsBackend>(
+pub(super) fn behavior_many<B: TrainingBackend + LinearLogProbsBackend, R: ResponseRecord>(
     model: &PackedLlamaForCausalLm<B>, adapters: Option<&LlamaLora<B>>,
-    responses: &[&Response], device: &B::Device, chunk: usize,
+    responses: &[&R], device: &B::Device, chunk: usize,
 ) -> Result<Vec<Vec<f32>>, TrainError> {
-    let mut output: Vec<_> = responses.iter().map(|r| r.behavior_log_probs.clone()).collect();
-    let missing: Vec<_> = responses.iter().enumerate().filter(|(_, r)| r.behavior_log_probs.is_none()).collect();
+    let mut output: Vec<_> = responses.iter().map(|r| r.behavior_log_probs().map(Vec::from)).collect();
+    let missing: Vec<_> = responses.iter().enumerate().filter(|(_, r)| r.behavior_log_probs().is_none()).collect();
     if !missing.is_empty() {
         let refs: Vec<_> = missing.iter().map(|(_, r)| **r).collect();
         for ((index, _), logp) in missing.into_iter().zip(probabilities_many(model, adapters, &refs, device, chunk)) {
@@ -111,26 +113,27 @@ pub(super) fn behavior_many<B: TrainingBackend + LinearLogProbsBackend>(
     Ok(output.into_iter().map(|v| v.expect("captured or computed behavior statistics")).collect())
 }
 
-fn prefix_statistics<B: TrainingBackend + LinearLogProbsBackend>(
+fn prefix_statistics<B: TrainingBackend + LinearLogProbsBackend, R: ResponseRecord>(
     model: &PackedLlamaForCausalLm<B>, adapters: Option<&LlamaLora<B>>,
-    responses: &[&Response], device: &B::Device, chunk: usize,
+    responses: &[&R], device: &B::Device, chunk: usize,
 ) -> Vec<Tensor<B, 1>> {
     let mut selected: Vec<Vec<Tensor<B, 1>>> = responses.iter().map(|_| Vec::new()).collect();
-    let maximum = responses.iter().map(|r| r.completion.len()).max().unwrap_or(0);
+    let maximum = responses.iter().map(|r| r.response().completion.len()).max().unwrap_or(0);
     for step in 0..maximum {
-        let active: Vec<_> = responses.iter().enumerate().filter(|(_, r)| step < r.completion.len()).collect();
-        let mut tokens = Vec::new();
-        let mut targets = Vec::new();
+        let active: Vec<_> = responses.iter().enumerate().filter(|(_, r)| step < r.response().completion.len()).collect();
+        let mut tokens: Vec<i32> = Vec::new();
+        let mut targets: Vec<i32> = Vec::new();
         let mut contexts = Vec::new();
         let mut boundaries = vec![0];
         for (_, response) in &active {
-            tokens.extend(&response.prompt);
-            tokens.extend(&response.completion[..step]);
-            let length = response.prompt.len() + step;
-            contexts.extend(response.rotary_context.as_ref().map(|v| v[..length].to_vec())
+            let source = response.response();
+            tokens.extend(&source.prompt);
+            tokens.extend(&source.completion[..step]);
+            let length = source.prompt.len() + step;
+            contexts.extend(response.rotary_context().map(|v| v[..length].to_vec())
                 .unwrap_or_else(|| vec![length; length]));
             targets.resize(tokens.len()-1, -100);
-            targets.push(response.completion[step]);
+            targets.push(source.completion[step]);
             boundaries.push(tokens.len());
         }
         let layout = PackedSequenceLayout::new(boundaries, tokens.len());
@@ -145,8 +148,8 @@ fn prefix_statistics<B: TrainingBackend + LinearLogProbsBackend>(
     selected.into_iter().map(|parts| Tensor::cat(parts, 0)).collect()
 }
 
-pub(in crate::training) fn reward_many<B: TrainingBackend>(model: &PackedLlamaForCausalLm<B>,
-    adapters: Option<&LlamaLora<B>>, head: &Linear<B>, responses: &[&Response],
+pub(in crate::training) fn reward_many<B: TrainingBackend, R: ResponseRecord>(model: &PackedLlamaForCausalLm<B>,
+    adapters: Option<&LlamaLora<B>>, head: &Linear<B>, responses: &[&R],
     device: &B::Device) -> Tensor<B, 1> {
     let batch = ResponseLayout::new(responses, true);
     let hidden = model.forward_train_packed_hidden_with_contexts(batch.inputs(device), &batch.layout, adapters,
@@ -159,8 +162,8 @@ pub(in crate::training) fn reward_many<B: TrainingBackend>(model: &PackedLlamaFo
 impl<B: AutodiffBackend + TrainingBackend + LinearLogProbsBackend> PpoTrainer<B> {
     /// Snapshot an entire ragged response batch with isolated packed forwards.
     /// Each reward vector belongs to one response; GAE restarts per document.
-    pub fn prepare_rollouts(&self, responses: Vec<Response>, rewards: &[Vec<f32>])
-        -> Result<Vec<PpoRollout>, TrainError> {
+    pub fn prepare_rollouts<R: ResponseRecord>(&self, responses: Vec<R>, rewards: &[Vec<f32>])
+        -> Result<Vec<PpoRollout<R>>, TrainError> {
         self.config.validate()?;
         if responses.is_empty() || responses.len() != rewards.len() {
             return Err(err("PPO needs a nonempty response batch and matching rewards"));
@@ -169,7 +172,7 @@ impl<B: AutodiffBackend + TrainingBackend + LinearLogProbsBackend> PpoTrainer<B>
             response.validate(self.actor.model())?;
             response.validate(&self.critic.backbone)?;
             response.validate(&self.reference.model)?;
-            if reward.len() != response.completion.len() || reward.iter().any(|x| !x.is_finite()) {
+            if reward.len() != response.response().completion.len() || reward.iter().any(|x| !x.is_finite()) {
                 return Err(err("one finite reward per completion token is required"));
             }
         }
@@ -190,7 +193,7 @@ impl<B: AutodiffBackend + TrainingBackend + LinearLogProbsBackend> PpoTrainer<B>
                 let mut returns = vec![0.0; n];
                 let mut gae = 0.0;
                 for t in (0..n).rev() {
-                    let next = if t + 1 == n && response.terminal { 0.0 } else { predicted[t + 1] };
+                    let next = if t + 1 == n && response.response().terminal { 0.0 } else { predicted[t + 1] };
                     let reward = rewards[t] - self.config.kl_coefficient * (old[t] - reference[t]);
                     let delta = reward + self.config.gamma * next - predicted[t];
                     gae = delta + self.config.gamma * self.config.gae_lambda * gae;

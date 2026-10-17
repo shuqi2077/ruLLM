@@ -4,7 +4,7 @@ pub(super) fn requested(request: &GenerateRequest) -> bool {
     request.tools_enabled() && (request.tools.as_ref().is_some_and(|tools| tools.iter()
         .any(|tool| tool.pointer("/function/strict").and_then(Value::as_bool) == Some(true)))
         || request.tool_choice.as_ref().is_some_and(|choice| choice.as_str() == Some("required") || choice.is_object())
-        || request.parallel_tool_calls == Some(false))
+        || request.parallel_tool_calls() == Some(false))
 }
 
 fn selected<'a>(request: &'a GenerateRequest) -> Result<Vec<&'a Value>, String> {
@@ -50,7 +50,7 @@ pub(super) fn grammar(request: &GenerateRequest, tokenizer: &tokenizers::Tokeniz
     -> Result<llguidance::api::TopLevelGrammar, String> {
     let functions = selected(request)?;
     let required = request.tool_choice.as_ref().is_some_and(|v| v.as_str() == Some("required") || v.is_object());
-    let parallel = request.parallel_tool_calls != Some(false);
+    let parallel = request.parallel_tool_calls() != Some(false);
     let root = match (required, parallel) {
         (false, true) => "text0 (call text0)*",
         (true, true) => "text0 call text0 (call text0)*",
@@ -91,7 +91,10 @@ pub(super) fn grammar(request: &GenerateRequest, tokenizer: &tokenizers::Tokeniz
             }
         }
         alternatives.push("\"<\" text1".into());
-        if !specials.is_empty() { alternatives.push(format!("<[{}]> text0", specials.join(","))); }
+        // Serving omits these special tokens from visible tool text. Preserve
+        // the delimiter-prefix state so invisible tokens cannot join two text
+        // fragments into an unvalidated visible <tool_call> marker.
+        if !specials.is_empty() { alternatives.push(format!("<[{}]> text{state}", specials.join(","))); }
         grammar.push_str(&format!("text{state}: {}\n", alternatives.join(" | ")));
     }
     Ok(llguidance::api::TopLevelGrammar::from_lark(grammar))
@@ -114,7 +117,7 @@ mod tests {
         let mut tokenizer = tokenizers::Tokenizer::new(model);
         tokenizer.with_pre_tokenizer(Some(tokenizers::pre_tokenizers::byte_level::ByteLevel::new(false, false, false)));
         tokenizer.with_decoder(Some(tokenizers::decoders::byte_level::ByteLevel::default()));
-        let mut added = vec![tokenizers::AddedToken::from("<eos>", true)];
+        let mut added = vec![tokenizers::AddedToken::from("<eos>", true), tokenizers::AddedToken::from("<ignored>", true)];
         if special_tags {
             added.push(tokenizers::AddedToken::from("<tool_call>", true));
             added.push(tokenizers::AddedToken::from("</tool_call>", true));
@@ -160,6 +163,7 @@ mod tests {
                 "<tool_call>{\"name\":\"first\",\"arguments\":{\"n\":9}}</tool_call>",
                 "<tool_call>{\"name\":\"first\",\"arguments\":{\"n\":2,\"other\":0}}</tool_call>",
                 "text <tool_call>not json</tool_call>",
+                "text <tool<ignored>_call>not json</tool_call>",
                 "<tool_call>{\"name\":\"first\",\"arguments\":{}",
             ] {
                 assert!(!accepts(&request, invalid, special), "{invalid}");

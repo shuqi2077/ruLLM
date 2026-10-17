@@ -65,7 +65,7 @@ pub use training::{
     export_huggingface_safetensors,
 };
 pub use training::{DpoTrainer, PpoTrainer, GrpoTrainer, RewardTrainer, ReferencePolicy, ValueCritic,
-    Response, PreferencePair, PpoConfig, GrpoConfig, PpoRollout, GrpoRollout, PostTrainingState};
+    Response, PagedResponse, ResponseRecord, PreferencePair, PpoConfig, GrpoConfig, PpoRollout, GrpoRollout, PostTrainingState};
 pub use paged_engine::{BatchStepReport, ContinuousBatchRunner, PagedLlamaEngine};
 
 pub use qwen35::{Qwen35TextConfig, Qwen35MoeConfig, Qwen35TextModel, Qwen35Cache, Qwen35LayerType, Qwen35RopeConfig, LoadedQwen35Text, load_huggingface_qwen35_text, load_huggingface_qwen35_text_packed};

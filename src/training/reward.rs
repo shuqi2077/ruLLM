@@ -1,5 +1,5 @@
 //! Pairwise reward learning and explicit outcome-reward scoring.
-use super::post_training::{metadata, read_metadata, write_metadata, reward_many};
+use super::post_training::{metadata, read_metadata, write_metadata, reward_many, ResponseRecord, PagedResponse};
 use super::trainer::{load_trainable, read_scalar, save_trainable};
 use super::{
     LlamaLora, PostTrainingState, PreferencePair, Response, SftTrainer, StepStats, TrainConfig,
@@ -17,16 +17,17 @@ fn error(value: impl std::fmt::Display) -> TrainError {
     TrainError(value.to_string())
 }
 
-fn score<B: TrainingBackend>(
+fn score<B: TrainingBackend, R: ResponseRecord>(
     model: &PackedLlamaForCausalLm<B>,
     adapters: Option<&LlamaLora<B>>,
     head: &Linear<B>,
-    response: &Response,
+    response: &R,
     device: &B::Device,
 ) -> Tensor<B, 1> {
-    if response.rotary_context.is_some() {
+    if response.rotary_context().is_some() {
         return reward_many(model, adapters, head, &[response], device);
     }
+    let response = response.response();
     let length = response.prompt.len() + response.completion.len();
     let hidden = model.forward_train_hidden(response.inputs(device, true), adapters);
     head.forward(hidden.slice([0..1, length - 1..length, 0..model.lora_shapes().hidden]))
@@ -67,11 +68,19 @@ impl<B: AutodiffBackend + TrainingBackend> RewardTrainer<B> {
     }
 
     pub fn step(&mut self, pairs: &[PreferencePair]) -> Result<StepStats, TrainError> {
+        self.step_responses(pairs)
+    }
+
+    pub fn step_paged(&mut self, pairs: &[PreferencePair<PagedResponse>]) -> Result<StepStats, TrainError> {
+        self.step_responses(pairs)
+    }
+
+    fn step_responses<R: ResponseRecord>(&mut self, pairs: &[PreferencePair<R>]) -> Result<StepStats, TrainError> {
         if pairs.is_empty() { return Err(error("reward training requires a nonempty local preference batch")); }
         for pair in pairs {
             pair.chosen.validate(self.actor.model())?;
             pair.rejected.validate(self.actor.model())?;
-            if pair.chosen.prompt != pair.rejected.prompt {
+            if pair.chosen.response().prompt != pair.rejected.response().prompt {
                 return Err(error("reward preference pair prompts differ"));
             }
         }
@@ -79,7 +88,7 @@ impl<B: AutodiffBackend + TrainingBackend> RewardTrainer<B> {
         let device = self.actor.device().clone();
         let tokens = pairs
             .iter()
-            .map(|pair| pair.chosen.completion.len() + pair.rejected.completion.len())
+            .map(|pair| pair.chosen.response().completion.len() + pair.rejected.response().completion.len())
             .sum();
         let head = &self.head;
         let responses: Vec<_> = pairs.iter().map(|p| &p.chosen)
@@ -120,7 +129,7 @@ impl<B: AutodiffBackend + TrainingBackend> RewardTrainer<B> {
     }
 
     /// One packed backbone forward for all complete responses, in input order.
-    pub fn score_batch(&self, responses: &[Response]) -> Result<Vec<f32>, TrainError> {
+    pub fn score_batch<R: ResponseRecord>(&self, responses: &[R]) -> Result<Vec<f32>, TrainError> {
         if responses.is_empty() { return Err(error("reward scoring needs at least one response")); }
         for response in responses { response.validate(self.actor.model())?; }
         let refs: Vec<_> = responses.iter().collect();
@@ -131,9 +140,9 @@ impl<B: AutodiffBackend + TrainingBackend> RewardTrainer<B> {
             .map_err(|e| error(format!("cannot read rewards: {e:?}")))
     }
 
-    pub fn token_rewards_batch(&self, responses: &[Response]) -> Result<Vec<Vec<f32>>, TrainError> {
+    pub fn token_rewards_batch<R: ResponseRecord>(&self, responses: &[R]) -> Result<Vec<Vec<f32>>, TrainError> {
         Ok(responses.iter().zip(self.score_batch(responses)?).map(|(response, reward)| {
-            let mut rewards = vec![0.0; response.completion.len()];
+            let mut rewards = vec![0.0; response.response().completion.len()];
             *rewards.last_mut().expect("validated completion") = reward;
             rewards
         }).collect())

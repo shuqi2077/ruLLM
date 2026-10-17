@@ -238,8 +238,6 @@ pub struct BatchStepReport {
     /// token-producing row (non-final prefill chunks produce none), or the
     /// accepted run of tokens for a speculative `Verify` row.
     pub selected: Vec<(RequestId, i32)>,
-    /// Committed KV token ranges `[start, end)` for rotary-context replay.
-    pub appended: Vec<(RequestId, usize, usize)>,
 }
 
 /// Continuous batching over one packed model: schedule → paged forward →
@@ -249,6 +247,7 @@ pub struct ContinuousBatchRunner<R: DeviceRuntime> {
     scheduler: ContinuousBatchScheduler,
     engine: PagedLlamaEngine<R>,
     selected_log_probs: Vec<(RequestId, f32)>,
+    appended_ranges: Vec<(RequestId, usize, usize)>,
 }
 
 impl<R> ContinuousBatchRunner<R>
@@ -270,7 +269,7 @@ where
     {
         let engine = PagedLlamaEngine::new(model, kv, device)?;
         let scheduler = ContinuousBatchScheduler::new_paged(batching, kv).map_err(scheduler_error)?;
-        Ok(Self { scheduler, engine, selected_log_probs: Vec::new() })
+        Ok(Self { scheduler, engine, selected_log_probs: Vec::new(), appended_ranges: Vec::new() })
     }
 
     pub fn submit(
@@ -359,10 +358,13 @@ where
     }
 
     /// Raw full-vocabulary, temperature-one log probabilities from the last
-    /// successful sampled step. No extra logits transfer; greedy/verify rows
-    /// are absent. These equal behavior log probabilities only for unfiltered
+    /// successful step that transferred logits. No extra logits transfer;
+    /// greedy-only and verify steps are absent. These equal behavior log probabilities only for unfiltered
     /// categorical requests without penalties, as used by post-training.
     pub fn selected_log_probs(&self) -> &[(RequestId, f32)] { &self.selected_log_probs }
+
+    /// Committed KV token ranges `[start, end)` from the most recent step.
+    pub fn appended_ranges(&self) -> &[(RequestId, usize, usize)] { &self.appended_ranges }
 
     /// Execute one scheduled batch. Returns `Ok(None)` when nothing is
     /// runnable. A failed device batch is rolled back before the error is
@@ -378,6 +380,7 @@ where
         BT: BoolElement,
     {
         self.selected_log_probs.clear();
+        self.appended_ranges.clear();
         let Some(batch) = self.scheduler.schedule().map_err(scheduler_error)? else {
             return Ok(None);
         };
@@ -390,7 +393,7 @@ where
                 }).collect::<Vec<_>>();
                 self.engine.commit_batch(&batch, &counts)?;
                 self.selected_log_probs = log_probs;
-                let appended = batch.sequences.iter().zip(&counts)
+                self.appended_ranges = batch.sequences.iter().zip(&counts)
                     .map(|(row, &count)| (row.request_id, row.start_position, row.start_position + count)).collect();
                 for row in &batch.sequences {
                     if self.scheduler.generated_tokens(row.request_id).is_none() {
@@ -403,7 +406,6 @@ where
                     rows: batch.batch_size(),
                     processed_tokens: batch.batch_size() * batch.next_n(),
                     selected,
-                    appended,
                 }))
             }
             Err(error) => {
