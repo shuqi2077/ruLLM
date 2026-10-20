@@ -394,7 +394,7 @@ fn paged_flash_attention_kernel<F: Float>(
                 &k_tile.slice(chunk * 16, 16 * row_stride),
                 row_stride_u32,
             );
-            cmma::execute::<F, F, f32, f32>(&query_fragment, &key_fragment, &scores, &scores);
+            cmma::execute::<F, F, f32, f32, _>(&query_fragment, &key_fragment, &scores, &scores);
         }
         cmma::store(
             &mut scores_tiles.slice_mut(s_base, s_base + 256),
@@ -470,7 +470,7 @@ fn paged_flash_attention_kernel<F: Float>(
                 cmma::MatrixLayout::Undefined,
                 0.0f32,
             );
-            cmma::execute::<F, F, f32, f32>(
+            cmma::execute::<F, F, f32, f32, _>(
                 &probability_fragment,
                 &value_fragment,
                 &product,
