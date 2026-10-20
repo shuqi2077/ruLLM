@@ -32,8 +32,8 @@ ruda-optim = { version = "0.21.71", path = "../ruda-optim", default-features = f
 ruccl = { version = "0.21.80", package = "ruCCL", path = "../ruCCL", default-features = false, optional = true }
 ruda-nn = { version = "0.21.73", path = "../ruda-nn", default-features = false, features = ["std"] }
 ruda-tensor = { version = "0.21.73", path = "../ruda-tensor", default-features = false, features = ["std", "kernel"] }
-ruda-tensor-device = { version = "0.21.73", path = "../ruda-tensor-device", default-features = false, features = ["std", "fusion"] }
-ruda-tensor-tch = { version = "0.21.77", path = "../ruda-tensor-tch", optional = true }
+ruda-tensor-device = { version = "0.21.73", path = "../ruda-tensor/device", default-features = false, features = ["std", "fusion"] }
+ruda-tensor-tch = { version = "0.21.77", path = "../ruda-tensor/tch", optional = true }
 tch = { version = "0.22.0", optional = true }
 ruda-store = { version = "0.21.63", path = "../ruda-store", default-features = false, features = ["std", "safetensors", "memmap"] }
 ruda-kernel = { version = "0.1.47", path = "../ruda-kernel", default-features = false, features = ["frontend-std", "library", "packed-quantization"] }
@@ -81,7 +81,7 @@ name = "qwen35_generate"
 required-features = ["nvidia"]
 
 [dev-dependencies]
-ruda-tensor-host = { path = "../ruda-tensor-host", default-features = false, features = ["std"] }
+ruda-tensor-host = { path = "../ruda-tensor/host", default-features = false, features = ["std"] }
 
 [[example]]
 name = "qwen2_stream"

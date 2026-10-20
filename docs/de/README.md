@@ -13,7 +13,7 @@ ruLLM kombiniert Tokenisierung, Modellladen, zwischengespeicherte autoregressive
 
 ## Schnellstart
 
-Richten Sie die [NVIDIA-Umgebung](../../../../docs/de/getting-started.md) ein und bereiten Sie ein lokales [Qwen3.5-0.8B-Modellverzeichnis](../../../../docs/de/model-inference.md#bereiten-sie-ein-lokales-modell-vor) vor.
+Richten Sie die [NVIDIA-Umgebung](../../../docs/de/getting-started.md) ein und bereiten Sie ein lokales [Qwen3.5-0.8B-Modellverzeichnis](../../../docs/de/model-inference.md#bereiten-sie-ein-lokales-modell-vor) vor.
 
 ```sh
 git clone https://github.com/shuqi2077/RUDA.git
@@ -21,16 +21,16 @@ cd RUDA
 cargo run --release --locked -p ruda-llm --features nvidia-ptx --example qwen35_generate -- ./models/qwen35 "The capital of France is" 8 1
 ```
 
-Ersetzen Sie `./models/qwen35` durch Ihr Modellverzeichnis. Die letzten Argumente wählen die maximale Anzahl neuer Token und die Anzahl der Läufe aus. Das Beispiel leitet standardmäßig PTX weiter, wenn `RUDA_CUDA_COMPILER` nicht festgelegt ist. Legen Sie es auf `nvrtc` fest, um stattdessen den C++-Kompilierungspfad CUDA zu verwenden. Informationen zur Auswahl der Zielversion finden Sie unter [PTX-Konfiguration](../../../../docs/de/ptx.md).
+Ersetzen Sie `./models/qwen35` durch Ihr Modellverzeichnis. Die letzten Argumente wählen die maximale Anzahl neuer Token und die Anzahl der Läufe aus. Das Beispiel leitet standardmäßig PTX weiter, wenn `RUDA_CUDA_COMPILER` nicht festgelegt ist. Legen Sie es auf `nvrtc` fest, um stattdessen den C++-Kompilierungspfad CUDA zu verwenden. Informationen zur Auswahl der Zielversion finden Sie unter [PTX-Konfiguration](../../../docs/de/ptx.md).
 
 ## Dokumentation
 
-- [Modellladen und Inferenz](../../../../docs/de/model-inference.md)
+- [Modellladen und Inferenz](../../../docs/de/model-inference.md)
 - [Cargo-Funktionen](../../Cargo.toml) · [Modulexporte](../../src/lib.rs)
 
 ## Modellladen und Inferenz
 
-[Dokumentation](../../../../docs/de/README.md) · [Schulung](../../../../docs/de/training.md) · [中文](../zh/README.md)
+[Dokumentation](../../../docs/de/README.md) · [Schulung](../../../docs/de/training.md) · [中文](../zh/README.md)
 
 ruLLM bietet Modellladen, Tokenisierung, zwischengespeicherte autoregressive Generierung und Anforderungsplanung. Sein Cargo-Paket ist `ruLLM`; Sein Rust-Importname ist `rullm`.
 
@@ -63,14 +63,14 @@ Loader akzeptieren lokale Verzeichnisse und laden keine Modelle herunter. Wähle
 
 ### Führen Sie die Beispiele zur Textgenerierung aus
 
-Führen Sie nach dem [Einrichten der Umgebung](../../../../docs/de/getting-started.md) diese Befehle im Quellstammverzeichnis aus. Die relativen Pfade verweisen auf zwei lokale Modellverzeichnisse:
+Führen Sie nach dem [Einrichten der Umgebung](../../../docs/de/getting-started.md) diese Befehle im Quellstammverzeichnis aus. Die relativen Pfade verweisen auf zwei lokale Modellverzeichnisse:
 
 ```powershell
 $env:RUDA_CUDA_COMPILER = 'nvrtc'
 cargo run --locked -p ruda-llm --features nvidia --example qwen2_generate -- ./models/qwen2 "Hello" 32 1
 ```
 
-Das Qwen3.5-Beispiel verwendet standardmäßig Ruda IR → PTX, wenn `RUDA_CUDA_COMPILER` nicht festgelegt ist. Verwenden Sie `--release` für eine optimierte Ausführung. Nicht unterstützte direkte PTX-Vorgänge geben Fehler zurück, anstatt auf NVRTC zurückzugreifen. Die PTX-Version muss mit der Zielversion GPU und dem Treiber übereinstimmen. siehe die [PTX Backend-Referenz](../../../../docs/de/ptx.md).
+Das Qwen3.5-Beispiel verwendet standardmäßig Ruda IR → PTX, wenn `RUDA_CUDA_COMPILER` nicht festgelegt ist. Verwenden Sie `--release` für eine optimierte Ausführung. Nicht unterstützte direkte PTX-Vorgänge geben Fehler zurück, anstatt auf NVRTC zurückzugreifen. Die PTX-Version muss mit der Zielversion GPU und dem Treiber übereinstimmen. siehe die [PTX Backend-Referenz](../../../docs/de/ptx.md).
 
 ```powershell
 Remove-Item Env:RUDA_CUDA_COMPILER -ErrorAction SilentlyContinue
@@ -95,9 +95,9 @@ Für ein Anwendungsverzeichnis neben dem Quellverzeichnis `RUDA` verwenden Sie d
 
 ```toml
 [dependencies]
-rullm = { package = "ruLLM", path = "../RUDA/crates/ruLLM", features = ["nvidia"] }
-ruda-tensor-device = { path = "../RUDA/crates/ruda-tensor-device", default-features = false, features = ["std", "cuda"] }
-ruda-driver-cuda = { path = "../RUDA/crates/ruda-driver-cuda", default-features = false, features = ["std"] }
+rullm = { package = "ruLLM", path = "../RUDA/ruLLM", features = ["nvidia"] }
+ruda-tensor-device = { path = "../RUDA/ruda-tensor/device", default-features = false, features = ["std", "cuda"] }
+ruda-driver-cuda = { path = "../RUDA/ruda-driver-cuda", default-features = false, features = ["std"] }
 half = "=2.7.1"
 
 ```
@@ -203,7 +203,7 @@ fn load_awq(
 }
 ```
 
-Die zurückgegebene Pipeline stellt außerdem `render_chat`, `encode`, `decode`, `generate_text` und `generate_text_sampled` bereit. Für die AWQ-Konfiguration sind `quant_method = "awq"`, `bits = 4`, `version = "gemm"` und `zero_point = true` erforderlich. `group_size` muss positiv sein oder `-1`. Lineare Projektionen verwenden F16-Aktivierungen. Siehe [ruBLAS INT4](../../../../docs/de/libraries/rublas.md) für gepackte Gewichtslayouts.
+Die zurückgegebene Pipeline stellt außerdem `render_chat`, `encode`, `decode`, `generate_text` und `generate_text_sampled` bereit. Für die AWQ-Konfiguration sind `quant_method = "awq"`, `bits = 4`, `version = "gemm"` und `zero_point = true` erforderlich. `group_size` muss positiv sein oder `-1`. Lineare Projektionen verwenden F16-Aktivierungen. Siehe [ruBLAS INT4](../../../docs/de/libraries/rublas.md) für gepackte Gewichtslayouts.
 
 ### Qwen3.5-Bildeingabe
 

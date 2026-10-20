@@ -38,7 +38,7 @@ pub(super) fn packed_tensor(checkpoint: &Checkpoint, name: &str, shape: [usize; 
 }
 
 // AWQ GEMM's stored nibble order is [0,2,4,6,1,3,5,7]. This inverse mapping
-// matches crates/ruBLAS/src/tensor_int4/kernel.rs. Zeros are direct (not GPTQ's +1).
+// matches ruBLAS/src/tensor_int4/kernel.rs. Zeros are direct (not GPTQ's +1).
 fn unpack_dense(qweight: &[i32], qzeros: &[i32], scales: &[f32],
     input: usize, output: usize, group_size: usize) -> Vec<f32>
 {

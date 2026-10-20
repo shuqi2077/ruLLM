@@ -20,7 +20,7 @@ import tempfile
 import time
 from datetime import datetime, timezone
 
-ROOT = Path(__file__).resolve().parents[3]
+ROOT = Path(__file__).resolve().parents[2]
 TIERS = ("reference", "core", "host", "gpu-nvidia", "gpu-amd", "feature-compile")
 
 
@@ -58,7 +58,7 @@ def execute(name: str, command: list[str], output: Path, timeout: int) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--suite", choices=TIERS, action="append", help="repeatable; default: reference and core")
-    parser.add_argument("--output", type=Path, default=ROOT / "crates/ruLLM/validation/runtime-v2")
+    parser.add_argument("--output", type=Path, default=ROOT / "ruLLM/validation/runtime-v2")
     parser.add_argument("--timeout", type=int, default=1800, help="per-command timeout in seconds")
     args = parser.parse_args()
     if args.timeout <= 0:
@@ -75,12 +75,12 @@ def main() -> int:
         return result
 
     if "reference" in suites:
-        run("v1-python-reference", [sys.executable, "crates/ruLLM/tools/verify_reference.py"])
-        run("v2-python-reference", [sys.executable, "crates/ruLLM/tools/verify_runtime_reference.py"])
+        run("v1-python-reference", [sys.executable, "ruLLM/tools/verify_reference.py"])
+        run("v2-python-reference", [sys.executable, "ruLLM/tools/verify_runtime_reference.py"])
     if "core" in suites:
         with tempfile.TemporaryDirectory(prefix="rullm-core-") as temporary:
             binary = str(Path(temporary) / ("runtime-tests.exe" if os.name == "nt" else "runtime-tests"))
-            result = run("rust-core-compile", ["rustc", "--edition=2024", "--test", "crates/ruLLM/src/runtime/mod.rs", "-o", binary])
+            result = run("rust-core-compile", ["rustc", "--edition=2024", "--test", "ruLLM/src/runtime/mod.rs", "-o", binary])
             if result["status"] == "PASS":
                 run("rust-core-tests", [binary, "--test-threads=2"])
             else:

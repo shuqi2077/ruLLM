@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Independent Python algorithm/integrity checks, NOT Rust compilation or tests.
 
-Run from any directory: python3 crates/ruLLM/tools/verify_reference.py
+Run from any directory: python3 ruLLM/tools/verify_reference.py
 This checks reference mathematics and artifact consistency. It cannot validate
 Rust typing, backend execution, generated machine code, or performance.
 """
@@ -14,7 +14,7 @@ import tomllib
 import unittest
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[3]
+ROOT = Path(__file__).resolve().parents[2]
 COUNTS = {"distribution_cases": 0, "stop_match_steps": 0, "admission_cases": 0}
 
 
@@ -144,7 +144,7 @@ class ReferenceChecks(unittest.TestCase):
                     COUNTS['admission_cases'] += 1
 
     def test_manifest_and_lock_consistency(self):
-        manifest = tomllib.loads((ROOT / 'crates/ruLLM/Cargo.toml').read_text())
+        manifest = tomllib.loads((ROOT / 'ruLLM/Cargo.toml').read_text())
         lock = tomllib.loads((ROOT / 'Cargo.lock').read_text())
         packages = lock['package']
         llm = next(p for p in packages if p['name'] == 'ruda-llm')
@@ -152,10 +152,10 @@ class ReferenceChecks(unittest.TestCase):
         self.assertIn('ruda-tensor-host', manifest['dev-dependencies'])
         self.assertTrue(any(p['name'] == 'ruda-tensor-host' for p in packages))
         for example in manifest.get('example', []):
-            self.assertTrue((ROOT / 'crates/ruLLM/examples' / (example['name'] + '.rs')).is_file())
+            self.assertTrue((ROOT / 'ruLLM/examples' / (example['name'] + '.rs')).is_file())
         for dependency in (*manifest['dependencies'].values(), *manifest['dev-dependencies'].values()):
             if isinstance(dependency, dict) and 'path' in dependency:
-                self.assertTrue((ROOT / 'crates/ruLLM' / dependency['path'] / 'Cargo.toml').is_file())
+                self.assertTrue((ROOT / 'ruLLM' / dependency['path'] / 'Cargo.toml').is_file())
 
     def test_new_modules_are_wired(self):
         expected = {
@@ -166,10 +166,10 @@ class ReferenceChecks(unittest.TestCase):
             'src/lib.rs': ['ContinuousBatchOptions', 'KvAdmissionPolicy', 'CancelledGeneration'],
         }
         for name, entries in expected.items():
-            source = (ROOT / 'crates/ruLLM' / name).read_text()
+            source = (ROOT / 'ruLLM' / name).read_text()
             for entry in entries:
                 self.assertIn(entry, source, f'{name}: missing {entry}')
-        scheduler = (ROOT / 'crates/ruLLM/src/continuous_batch.rs').read_text()
+        scheduler = (ROOT / 'ruLLM/src/continuous_batch.rs').read_text()
         snapshot = scheduler.split('pub fn snapshot(&self)', 1)[1].split('pub fn kv_cache', 1)[0]
         self.assertNotIn('kv_cache.snapshot()', snapshot)
 

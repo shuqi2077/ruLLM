@@ -16,7 +16,7 @@ import tomllib
 import unittest
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[3]
+ROOT = Path(__file__).resolve().parents[2]
 COUNTS = {"subgroup_cases": 0, "layout_cases": 0, "kv_budget_cases": 0, "numeric_cases": 0, "recovery_cases": 0}
 U64 = (1 << 64) - 1
 
@@ -182,24 +182,24 @@ class RuntimeReferenceTests(unittest.TestCase):
         self.assertEqual(statistics.median([.8, 1., 1.2, 1.4]), 1.1)
 
     def test_original_public_struct_fields_are_unchanged(self):
-        snapshot = json.loads((ROOT / "crates/ruLLM/tests/fixtures/public_api_v1.json").read_text())
+        snapshot = json.loads((ROOT / "ruLLM/tests/fixtures/public_api_v1.json").read_text())
         for record in snapshot:
             source = (ROOT / record["file"]).read_text()
             self.assertEqual(public_struct(source, record["name"]), record["body"], record["name"])
 
     def test_features_lockfile_and_examples_are_connected(self):
-        manifest = tomllib.loads((ROOT / "crates/ruLLM/Cargo.toml").read_text())
+        manifest = tomllib.loads((ROOT / "ruLLM/Cargo.toml").read_text())
         self.assertEqual(manifest["features"]["default"], [])
         self.assertIn("dep:ruda-driver-hip", manifest["features"]["amd"])
         self.assertIn("ruda-tensor/hip", manifest["features"]["amd"])
         for name, dep in manifest["dependencies"].items():
             if isinstance(dep, dict) and "path" in dep:
-                self.assertTrue((ROOT / "crates/ruLLM" / dep["path"] / "Cargo.toml").is_file(), name)
+                self.assertTrue((ROOT / "ruLLM" / dep["path"] / "Cargo.toml").is_file(), name)
         lock = tomllib.loads((ROOT / "Cargo.lock").read_text())
         package = next(p for p in lock["package"] if p["name"] == "ruda-llm")
         self.assertIn("ruda-driver-hip", package["dependencies"])
         for example in manifest["example"]:
-            self.assertTrue((ROOT / "crates/ruLLM/examples" / (example["name"] + ".rs")).is_file())
+            self.assertTrue((ROOT / "ruLLM/examples" / (example["name"] + ".rs")).is_file())
             for feature in example.get("required-features", []):
                 self.assertIn(feature, manifest["features"])
 

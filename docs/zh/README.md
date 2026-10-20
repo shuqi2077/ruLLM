@@ -26,9 +26,9 @@ cargo run --release --locked -p ruda-llm --features nvidia-ptx --example qwen35_
 ## 文档
 
 - [模型加载与推理](https://github.com/shuqi2077/RUDA/blob/main/docs/zh/model-inference.md)
-- [Llama／Qwen2 分页执行与连续批处理](../../../../docs/zh/model-inference.md#llamaqwen2-分页执行)
-- [OpenAI 风格 HTTP／SSE 服务](../../../../docs/zh/model-inference.md#openai-风格-http-服务)
-- [Rust ruLLM SFT 与 LoRA](../../../../docs/zh/finetuning.md#rust-rullm-sft-与-lora)
+- [Llama／Qwen2 分页执行与连续批处理](../../../docs/zh/model-inference.md#llamaqwen2-分页执行)
+- [OpenAI 风格 HTTP／SSE 服务](../../../docs/zh/model-inference.md#openai-风格-http-服务)
+- [Rust ruLLM SFT 与 LoRA](../../../docs/zh/finetuning.md#rust-rullm-sft-与-lora)
 - [Cargo features](../../Cargo.toml) · [模块入口](../../src/lib.rs)
 
 ## 分页推理、服务与 SFT
@@ -106,9 +106,9 @@ cargo run --release --locked -p ruda-llm --features nvidia-ptx --example qwen35_
 
 ```toml
 [dependencies]
-rullm = { package = "ruLLM", path = "../RUDA/crates/ruLLM", features = ["nvidia"] }
-ruda-tensor-device = { path = "../RUDA/crates/ruda-tensor-device", default-features = false, features = ["std", "cuda"] }
-ruda-driver-cuda = { path = "../RUDA/crates/ruda-driver-cuda", default-features = false, features = ["std"] }
+rullm = { package = "ruLLM", path = "../RUDA/ruLLM", features = ["nvidia"] }
+ruda-tensor-device = { path = "../RUDA/ruda-tensor/device", default-features = false, features = ["std", "cuda"] }
+ruda-driver-cuda = { path = "../RUDA/ruda-driver-cuda", default-features = false, features = ["std"] }
 half = "=2.7.1"
 
 ```
