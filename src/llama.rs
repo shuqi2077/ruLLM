@@ -22,6 +22,7 @@ use crate::training::{
 use ruda_kernel::tensor::RudaTensor;
 
 pub(crate) mod awq;
+pub(crate) mod gguf;
 pub(crate) mod rope;
 #[cfg(all(test, feature = "nvidia"))]
 mod paged_rope_tests;

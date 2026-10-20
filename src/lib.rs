@@ -87,6 +87,8 @@ pub use llama::{
     LlamaForCausalLm, LlamaKvCache, LlamaKvCacheRecord, LlamaLayerCache, PackedLlamaForCausalLm,
 };
 pub use llama::awq::{AwqBackend, AwqLlamaForCausalLm};
+pub use llama::gguf::{GgufBackend, GgufCausalLm, GgufLoadError, LoadedGguf, load_gguf};
+pub use ruda_store::gguf::{GgufEndian, GgufFile, GgufModel, GgufPackedTensor, GgufTensorInfo, GgufValue, GgmlType};
 #[cfg(feature = "tensor-parallel")]
 pub use llama::parallel::{
     LlamaTensorParallel, LlamaTensorParallelRank, LlamaTensorParallelCache,
