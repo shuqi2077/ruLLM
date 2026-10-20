@@ -13,7 +13,7 @@ ruLLM сочетает в себе токенизацию, загрузку мо
 
 ## Краткое руководство
 
-Настройте [среду NVIDIA](../../../docs/ru/getting-started.md) и подготовьте локальный [каталог модели Qwen3.5-0.8B](../../../docs/ru/model-inference.md#подготовьте-локальную-модель).
+Настройте [среду NVIDIA](../../../../docs/ru/getting-started.md) и подготовьте локальный [каталог модели Qwen3.5-0.8B](../../../../docs/ru/model-inference.md#подготовьте-локальную-модель).
 
 ```sh
 git clone https://github.com/shuqi2077/RUDA.git
@@ -21,16 +21,16 @@ cd RUDA
 cargo run --release --locked -p ruda-llm --features nvidia-ptx --example qwen35_generate -- ./models/qwen35 "The capital of France is" 8 1
 ```
 
-Замените `./models/qwen35` каталогом вашей модели. Последние аргументы выбирают максимальное количество новых токенов и количество запусков. В примере по умолчанию используется прямой PTX, когда `RUDA_CUDA_COMPILER` не установлен. Установите для него значение `nvrtc`, чтобы вместо этого использовать путь компиляции C++ CUDA. См. [Конфигурация PTX](../../../docs/ru/ptx.md) для выбора целевой версии.
+Замените `./models/qwen35` каталогом вашей модели. Последние аргументы выбирают максимальное количество новых токенов и количество запусков. В примере по умолчанию используется прямой PTX, когда `RUDA_CUDA_COMPILER` не установлен. Установите для него значение `nvrtc`, чтобы вместо этого использовать путь компиляции C++ CUDA. См. [Конфигурация PTX](../../../../docs/ru/ptx.md) для выбора целевой версии.
 
 ## Документация
 
-- [Загрузка и вывод модели](../../../docs/ru/model-inference.md)
+- [Загрузка и вывод модели](../../../../docs/ru/model-inference.md)
 - [Функции Cargo](../../Cargo.toml) · [Экспорт модулей](../../src/lib.rs)
 
 ## Загрузка моделей и инференс
 
-[Документация](../../../docs/ru/README.md) · [Обучение](../../../docs/ru/training.md) · [中文](../zh/README.md)
+[Документация](../../../../docs/ru/README.md) · [Обучение](../../../../docs/ru/training.md) · [中文](../zh/README.md)
 
 ruLLM обеспечивает загрузку модели, токенизацию, кэшированную авторегрессионную генерацию и планирование запросов. Его пакет Cargo — `ruLLM`; его имя для импорта в Rust — `rullm`.
 
@@ -63,14 +63,14 @@ ruLLM обеспечивает загрузку модели, токенизац
 
 ### Запустите примеры генерации текста
 
-После [настройки среды](../../../docs/ru/getting-started.md) запустите эти команды из корня исходного кода. Относительные пути указывают на два локальных каталога модели:
+После [настройки среды](../../../../docs/ru/getting-started.md) запустите эти команды из корня исходного кода. Относительные пути указывают на два локальных каталога модели:
 
 ```powershell
 $env:RUDA_CUDA_COMPILER = 'nvrtc'
 cargo run --locked -p ruda-llm --features nvidia --example qwen2_generate -- ./models/qwen2 "Hello" 32 1
 ```
 
-В примере Qwen3.5 по умолчанию используется Ruda IR → PTX, если `RUDA_CUDA_COMPILER` не установлен. Используйте `--release` для оптимизации выполнения. Неподдерживаемые прямые операции PTX возвращают ошибки, а не возвращаются к NVRTC. Версия PTX должна соответствовать целевому GPU и драйверу; см. [Справочник по бэкенда PTX](../../../docs/ru/ptx.md).
+В примере Qwen3.5 по умолчанию используется Ruda IR → PTX, если `RUDA_CUDA_COMPILER` не установлен. Используйте `--release` для оптимизации выполнения. Неподдерживаемые прямые операции PTX возвращают ошибки, а не возвращаются к NVRTC. Версия PTX должна соответствовать целевому GPU и драйверу; см. [Справочник по бэкенда PTX](../../../../docs/ru/ptx.md).
 
 ```powershell
 Remove-Item Env:RUDA_CUDA_COMPILER -ErrorAction SilentlyContinue
@@ -95,9 +95,9 @@ cargo run --release --locked -p ruda-llm --features nvidia-ptx --example qwen35_
 
 ```toml
 [dependencies]
-rullm = { package = "ruLLM", path = "../RUDA/ruLLM", features = ["nvidia"] }
-ruda-tensor-device = { path = "../RUDA/ruda-tensor-device", default-features = false, features = ["std", "cuda"] }
-ruda-driver-cuda = { path = "../RUDA/ruda-driver-cuda", default-features = false, features = ["std"] }
+rullm = { package = "ruLLM", path = "../RUDA/crates/ruLLM", features = ["nvidia"] }
+ruda-tensor-device = { path = "../RUDA/crates/ruda-tensor-device", default-features = false, features = ["std", "cuda"] }
+ruda-driver-cuda = { path = "../RUDA/crates/ruda-driver-cuda", default-features = false, features = ["std"] }
 half = "=2.7.1"
 
 ```
@@ -203,7 +203,7 @@ fn load_awq(
 }
 ```
 
-Возвращенный конвейер также предоставляет `render_chat`, `encode`, `decode`, `generate_text` и `generate_text_sampled`. Для конфигурации AWQ требуются `quant_method = "awq"`, `bits = 4`, `version = "gemm"` и `zero_point = true`. `group_size` должен быть положительным или `-1`. Линейные проекции используют активации F16. См. [ruBLAS INT4](../../../docs/ru/libraries/rublas.md) для получения информации о весе в упаковке.
+Возвращенный конвейер также предоставляет `render_chat`, `encode`, `decode`, `generate_text` и `generate_text_sampled`. Для конфигурации AWQ требуются `quant_method = "awq"`, `bits = 4`, `version = "gemm"` и `zero_point = true`. `group_size` должен быть положительным или `-1`. Линейные проекции используют активации F16. См. [ruBLAS INT4](../../../../docs/ru/libraries/rublas.md) для получения информации о весе в упаковке.
 
 ### Ввод изображения Qwen3.5
 

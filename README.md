@@ -1,6 +1,6 @@
 # ruLLM
 
-**English** | [简体中文](https://github.com/shuqi2077/RUDA/blob/main/ruLLM/docs/zh/README.md) | [日本語](https://github.com/shuqi2077/RUDA/blob/main/ruLLM/docs/ja/README.md) | [Deutsch](https://github.com/shuqi2077/RUDA/blob/main/ruLLM/docs/de/README.md) | [Русский](https://github.com/shuqi2077/RUDA/blob/main/ruLLM/docs/ru/README.md)
+**English** | [简体中文](https://github.com/shuqi2077/RUDA/blob/main/crates/ruLLM/docs/zh/README.md) | [日本語](https://github.com/shuqi2077/RUDA/blob/main/crates/ruLLM/docs/ja/README.md) | [Deutsch](https://github.com/shuqi2077/RUDA/blob/main/crates/ruLLM/docs/de/README.md) | [Русский](https://github.com/shuqi2077/RUDA/blob/main/crates/ruLLM/docs/ru/README.md)
 
 LLM training, inference, model loading, and text generation on Ruda.
 
@@ -53,10 +53,10 @@ Replace `./models/qwen35` with your model directory. The final arguments select 
 ## Documentation
 
 - [Model loading and inference](https://github.com/shuqi2077/RUDA/blob/main/docs/en/model-inference.md)
-- [Paged inference and continuous batching](../docs/en/model-inference.md#paged-llamaqwen2-execution)
-- [OpenAI-compatible HTTP/SSE server](../docs/en/model-inference.md#openai-compatible-http-server)
-- [Rust ruLLM SFT and LoRA](../docs/en/finetuning.md#rust-rullm-sft-and-lora)
-- [Cargo features](https://github.com/shuqi2077/RUDA/blob/main/ruLLM/Cargo.toml) · [Module exports](https://github.com/shuqi2077/RUDA/blob/main/ruLLM/src/lib.rs)
+- [Paged inference and continuous batching](../../docs/en/model-inference.md#paged-llamaqwen2-execution)
+- [OpenAI-compatible HTTP/SSE server](../../docs/en/model-inference.md#openai-compatible-http-server)
+- [Rust ruLLM SFT and LoRA](../../docs/en/finetuning.md#rust-rullm-sft-and-lora)
+- [Cargo features](https://github.com/shuqi2077/RUDA/blob/main/crates/ruLLM/Cargo.toml) · [Module exports](https://github.com/shuqi2077/RUDA/blob/main/crates/ruLLM/src/lib.rs)
 
 ## Paged inference, serving, and SFT
 
@@ -68,7 +68,7 @@ The NVIDIA examples are `qwen2_continuous_batch`, `qwen2_openai_server`, and `qw
 
 ## Model Loading and Inference
 
-[Documentation](https://github.com/shuqi2077/RUDA/blob/main/docs/en/README.md) · [Training](https://github.com/shuqi2077/RUDA/blob/main/docs/en/training.md) · [中文](https://github.com/shuqi2077/RUDA/blob/main/ruLLM/docs/zh/README.md)
+[Documentation](https://github.com/shuqi2077/RUDA/blob/main/docs/en/README.md) · [Training](https://github.com/shuqi2077/RUDA/blob/main/docs/en/training.md) · [中文](https://github.com/shuqi2077/RUDA/blob/main/crates/ruLLM/docs/zh/README.md)
 
 ruLLM provides model loading, tokenization, cached autoregressive generation, and request scheduling. Its Cargo package is `ruda-llm`; its Rust import name is `rullm`.
 
@@ -133,9 +133,9 @@ For an application directory alongside the `RUDA` source directory, use these de
 
 ```toml
 [dependencies]
-rullm = { package = "ruda-llm", path = "../RUDA/ruLLM", features = ["nvidia"] }
-ruda-tensor-device = { path = "../RUDA/ruda-tensor-device", default-features = false, features = ["std", "cuda"] }
-ruda-driver-cuda = { path = "../RUDA/ruda-driver-cuda", default-features = false, features = ["std"] }
+rullm = { package = "ruda-llm", path = "../RUDA/crates/ruLLM", features = ["nvidia"] }
+ruda-tensor-device = { path = "../RUDA/crates/ruda-tensor-device", default-features = false, features = ["std", "cuda"] }
+ruda-driver-cuda = { path = "../RUDA/crates/ruda-driver-cuda", default-features = false, features = ["std"] }
 half = "=2.7.1"
 
 ```
@@ -294,7 +294,7 @@ To integrate your own batch executor, use `ContinuousBatchScheduler`:
 
 The scheduler manages requests and page-allocation metadata. The caller's executor owns device KV storage and model execution. Use `token_matrix()`, `context_lengths()`, and `flattened_block_table()` to construct batch inputs. Complete or cancel an outstanding batch before calling `schedule()` again.
 
-API reference: [ruLLM exports](https://github.com/shuqi2077/RUDA/blob/main/ruLLM/src/lib.rs), [Generation options](https://github.com/shuqi2077/RUDA/blob/main/ruLLM/src/generation.rs), [Scheduler](https://github.com/shuqi2077/RUDA/blob/main/ruLLM/src/continuous_batch.rs).
+API reference: [ruLLM exports](https://github.com/shuqi2077/RUDA/blob/main/crates/ruLLM/src/lib.rs), [Generation options](https://github.com/shuqi2077/RUDA/blob/main/crates/ruLLM/src/generation.rs), [Scheduler](https://github.com/shuqi2077/RUDA/blob/main/crates/ruLLM/src/continuous_batch.rs).
 
 ### Qwen3.5 fused paged attention
 

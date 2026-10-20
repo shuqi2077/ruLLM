@@ -13,7 +13,7 @@ ruLLM は、トークン化、モデルの読み込み、キャッシュされ�
 
 ## クイック スタート
 
-[NVIDIA環境](../../../docs/ja/getting-started.md)をセットアップし、ローカルの[Qwen3.5-0.8Bモデルディレクトリ](../../../docs/ja/model-inference.md#ローカルモデルの準備)を準備します。
+[NVIDIA環境](../../../../docs/ja/getting-started.md)をセットアップし、ローカルの[Qwen3.5-0.8Bモデルディレクトリ](../../../../docs/ja/model-inference.md#ローカルモデルの準備)を準備します。
 
 ```sh
 git clone https://github.com/shuqi2077/RUDA.git
@@ -21,16 +21,16 @@ cd RUDA
 cargo run --release --locked -p ruda-llm --features nvidia-ptx --example qwen35_generate -- ./models/qwen35 "The capital of France is" 8 1
 ```
 
-`./models/qwen35` をモデル ディレクトリに置き換えます。最後の引数は、新しいトークンの最大数と実行数を選択します。この例では、`RUDA_CUDA_COMPILER` が設定されていない場合、デフォルトで PTX を指定します。代わりに CUDA C++ コンパイル パスを使用するには、これを `nvrtc` に設定します。ターゲット バージョンの選択については、[PTX 構成](../../../docs/ja/ptx.md) を参照してください。
+`./models/qwen35` をモデル ディレクトリに置き換えます。最後の引数は、新しいトークンの最大数と実行数を選択します。この例では、`RUDA_CUDA_COMPILER` が設定されていない場合、デフォルトで PTX を指定します。代わりに CUDA C++ コンパイル パスを使用するには、これを `nvrtc` に設定します。ターゲット バージョンの選択については、[PTX 構成](../../../../docs/ja/ptx.md) を参照してください。
 
 ## ドキュメント
 
-- [モデルの読み込みと推論](../../../docs/ja/model-inference.md)
+- [モデルの読み込みと推論](../../../../docs/ja/model-inference.md)
 - [Cargo 機能](../../Cargo.toml) · [モジュール エクスポート](../../src/lib.rs)
 
 ## モデルのロードと推論
 
-[ドキュメント](../../../docs/ja/README.md) · [トレーニング](../../../docs/ja/training.md) · [中文](../zh/README.md)
+[ドキュメント](../../../../docs/ja/README.md) · [トレーニング](../../../../docs/ja/training.md) · [中文](../zh/README.md)
 
 ruLLM は、モデルの読み込み、トークン化、キャッシュされた自己回帰生成、およびリクエストのスケジューリングを提供します。 Cargo パッケージは `ruLLM` です。 Rust インポート名は `rullm` です。
 
@@ -63,14 +63,14 @@ ruLLM は、モデルの読み込み、トークン化、キャッシュされ�
 
 ### テキスト生成サンプルの実行
 
-[環境のセットアップ](../../../docs/ja/getting-started.md) 後、ソース ルートからこれらのコマンドを実行します。相対パスは 2 つのローカル モデル ディレクトリを指します。
+[環境のセットアップ](../../../../docs/ja/getting-started.md) 後、ソース ルートからこれらのコマンドを実行します。相対パスは 2 つのローカル モデル ディレクトリを指します。
 
 ```powershell
 $env:RUDA_CUDA_COMPILER = 'nvrtc'
 cargo run --locked -p ruda-llm --features nvidia --example qwen2_generate -- ./models/qwen2 "Hello" 32 1
 ```
 
-Qwen3.5 の例では、`RUDA_CUDA_COMPILER` が設定されていない場合、デフォルトで Ruda IR → PTX になります。実行を最適化するには、`--release` を使用します。サポートされていない直接 PTX 操作は、NVRTC にフォールバックするのではなく、エラーを返します。 PTX のバージョンは、ターゲット GPU およびドライバーと一致する必要があります。 [PTX バックエンドリファレンス](../../../docs/ja/ptx.md) を参照してください。
+Qwen3.5 の例では、`RUDA_CUDA_COMPILER` が設定されていない場合、デフォルトで Ruda IR → PTX になります。実行を最適化するには、`--release` を使用します。サポートされていない直接 PTX 操作は、NVRTC にフォールバックするのではなく、エラーを返します。 PTX のバージョンは、ターゲット GPU およびドライバーと一致する必要があります。 [PTX バックエンドリファレンス](../../../../docs/ja/ptx.md) を参照してください。
 
 ```powershell
 Remove-Item Env:RUDA_CUDA_COMPILER -ErrorAction SilentlyContinue
@@ -95,9 +95,9 @@ cargo run --release --locked -p ruda-llm --features nvidia-ptx --example qwen35_
 
 ```toml
 [dependencies]
-rullm = { package = "ruLLM", path = "../RUDA/ruLLM", features = ["nvidia"] }
-ruda-tensor-device = { path = "../RUDA/ruda-tensor-device", default-features = false, features = ["std", "cuda"] }
-ruda-driver-cuda = { path = "../RUDA/ruda-driver-cuda", default-features = false, features = ["std"] }
+rullm = { package = "ruLLM", path = "../RUDA/crates/ruLLM", features = ["nvidia"] }
+ruda-tensor-device = { path = "../RUDA/crates/ruda-tensor-device", default-features = false, features = ["std", "cuda"] }
+ruda-driver-cuda = { path = "../RUDA/crates/ruda-driver-cuda", default-features = false, features = ["std"] }
 half = "=2.7.1"
 
 ```
@@ -203,7 +203,7 @@ fn load_awq(
 }
 ```
 
-返されたパイプラインは、`render_chat`、`encode`、`decode`、`generate_text`、および `generate_text_sampled` も提供します。 AWQ 構成には、`quant_method = "awq"`、`bits = 4`、`version = "gemm"`、および `zero_point = true` が必要です。 `group_size` は正または `-1` でなければなりません。線形投影では、F16 アクティベーションを使用します。梱包重量レイアウトについては、[ruBLAS INT4](../../../docs/ja/libraries/rublas.md) を参照してください。
+返されたパイプラインは、`render_chat`、`encode`、`decode`、`generate_text`、および `generate_text_sampled` も提供します。 AWQ 構成には、`quant_method = "awq"`、`bits = 4`、`version = "gemm"`、および `zero_point = true` が必要です。 `group_size` は正または `-1` でなければなりません。線形投影では、F16 アクティベーションを使用します。梱包重量レイアウトについては、[ruBLAS INT4](../../../../docs/ja/libraries/rublas.md) を参照してください。
 
 ### Qwen3.5画像入力
 
