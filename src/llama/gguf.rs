@@ -81,7 +81,7 @@ impl<R: DeviceRuntime> FeedForward<R> where R::Device: DeviceOps {
             Self::Experts { router, gate, up, down, count, selected, normalize, scale, shared, shared_gate } => {
                 let [batch, sequence, hidden] = input.dims();
                 let tokens = batch * sequence;
-                let probabilities = ruda_tensor::activation::softmax(router.forward(input.clone())?, 2)
+                let probabilities = ruda_tensor::api::activation::softmax(router.forward(input.clone())?, 2)
                     .reshape([tokens, *count]);
                 let (mut weights, indices) = probabilities.topk_with_indices(*selected, 1);
                 if *normalize {
@@ -108,7 +108,7 @@ impl<R: DeviceRuntime> FeedForward<R> where R::Device: DeviceOps {
                         let gate = Tensor::<GgufBackend<R>, 3>::from_primitive(TensorPrimitive::Float(
                             gate.forward(input.into_primitive().tensor())?,
                         ));
-                        value = value * ruda_tensor::activation::sigmoid(gate);
+                        value = value * ruda_tensor::api::activation::sigmoid(gate);
                     }
                     output = output + value;
                 }

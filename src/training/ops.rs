@@ -18,6 +18,7 @@ use ruda_autodiff::ops::{Backward, Ops, OpsKind};
 use ruda_kernel::tensor::RudaTensor;
 use ruda_kernel::tensor::contiguous::into_contiguous;
 use ruda_tensor::api::{DType, IndexingUpdateOp, Int, Tensor};
+use ruda_tensor::ops::FloatTensorOps;
 use ruda_tensor::tensor::{FloatTensor, IntTensor};
 use ruda_tensor::{Backend, DeviceOps, TensorPrimitive};
 use ruda_tensor_device::{BoolElement, DeviceBackend, DeviceRuntime, FloatElement, IntElement};
@@ -392,6 +393,12 @@ impl<B: Backend, C: CheckpointStrategy> LinearCrossEntropyBackend for Autodiff<B
         normalizer: usize,
         chunk_rows: usize,
     ) -> FloatTensor<Self> {
+        let context = Self::float_autodiff_context(&hidden)
+            .merge(Self::float_autodiff_context(&weight))
+            .merge(targets.context);
+        let hidden = Self::float_with_autodiff_context(hidden, context);
+        let weight = Self::float_with_autodiff_context(weight, context);
+        let targets = targets.primitive;
         let inner = |with_gradients| {
             chunked_cross_entropy::<B>(
                 Tensor::from_primitive(TensorPrimitive::Float(hidden.primitive.clone())),

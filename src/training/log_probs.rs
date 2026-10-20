@@ -6,6 +6,7 @@ use ruda_autodiff::{
     ops::{Backward, Ops, OpsKind},
 };
 use ruda_tensor::api::{DType, IndexingUpdateOp, Int, Tensor};
+use ruda_tensor::ops::FloatTensorOps;
 use ruda_tensor::{
     Backend, DeviceOps, TensorPrimitive,
     tensor::{FloatTensor, IntTensor},
@@ -174,10 +175,15 @@ impl<B: Backend, C: CheckpointStrategy> LinearLogProbsBackend for Autodiff<B, C>
         targets: IntTensor<Self>,
         chunk_rows: usize,
     ) -> FloatTensor<Self> {
+        let context = Self::float_autodiff_context(&hidden)
+            .merge(Self::float_autodiff_context(&weight))
+            .merge(targets.context);
+        let hidden = Self::float_with_autodiff_context(hidden, context);
+        let weight = Self::float_with_autodiff_context(weight, context);
         let state: LogProbsState<B> = LogProbsState {
             hidden: hidden.primitive.clone(),
             weight: weight.primitive.clone(),
-            targets,
+            targets: targets.primitive,
             chunk_rows,
         };
         let output = calculate::<B>(
