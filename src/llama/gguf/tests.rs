@@ -34,9 +34,12 @@ fn packed_gguf_models_match_independent_full_and_cached_logits() {
         check_storage("output_norm.weight", &model.norm);
         check_storage(if architecture == "qwen2" { "token_embd.weight" } else { "output.weight" }, &model.output.weight);
         for (index, layer) in model.layers.iter().enumerate() {
+            let FeedForward::Dense(feed_forward) = &layer.feed_forward else {
+                panic!("{architecture} fixture must use dense feed-forward layers");
+            };
             for (name, projection) in [("attn_q", &layer.q), ("attn_k", &layer.k),
-                ("attn_v", &layer.v), ("attn_output", &layer.o), ("ffn_gate", &layer.gate),
-                ("ffn_up", &layer.up), ("ffn_down", &layer.down)] {
+                ("attn_v", &layer.v), ("attn_output", &layer.o), ("ffn_gate", &feed_forward.gate),
+                ("ffn_up", &feed_forward.up), ("ffn_down", &feed_forward.down)] {
                 check_storage(&format!("blk.{index}.{name}.weight"), &projection.weight);
                 if let Some(bias) = &projection.bias {
                     check_storage(&format!("blk.{index}.{name}.bias"), bias);
