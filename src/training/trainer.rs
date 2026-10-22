@@ -1,4 +1,4 @@
-//! AdamW trainer for packed Llama/Qwen2 models (full fine-tuning or LoRA).
+//! Architecture-independent AdamW trainer (full fine-tuning or LoRA).
 //!
 //! One optimizer step consumes `gradient_accumulation` micro-batches; each
 //! micro-batch loss is normalized by the step's total valid-token count so
@@ -8,7 +8,7 @@
 //! `keep_checkpoints` are retained.
 
 use super::data::{SftBatch, SftLoader, SftLoaderState};
-use super::lora::LlamaLora;
+use super::model::SftModel;
 use super::ops::{TrainingBackend, cross_entropy_chunk_rows};
 use crate::PackedLlamaForCausalLm;
 use ruda_model::module::{AutodiffModule, Module, ModuleMapper, ModuleVisitor, Param};
@@ -204,9 +204,6 @@ pub(super) fn clip_global_norm<B: AutodiffBackend, M: AutodiffModule<B>>(
     Ok(norm)
 }
 
-type FullOptimizer<B> = OptimizerAdaptor<AdamW, PackedLlamaForCausalLm<B>, B>;
-type LoraOptimizer<B> = OptimizerAdaptor<AdamW, LlamaLora<B>, B>;
-
 /// Trainable float parameters are checkpointed as Safetensors keyed by
 /// `<visit index>:<ParamId>`, bit-exact in their own dtypes. The module
 /// recorders convert every float to the backend's default element on load,
@@ -330,18 +327,18 @@ where
     }
 }
 
-enum Trainable<B: AutodiffBackend + TrainingBackend> {
-    Full(FullOptimizer<B>),
+enum Trainable<B: AutodiffBackend + TrainingBackend, M: SftModel<B>> {
+    Full(OptimizerAdaptor<AdamW, M, B>),
     Lora {
-        adapters: LlamaLora<B>,
-        optimizer: LoraOptimizer<B>,
+        adapters: M::Adapters,
+        optimizer: OptimizerAdaptor<AdamW, M::Adapters, B>,
     },
 }
 
 /// Supervised fine-tuning / continued pre-training driver.
-pub struct SftTrainer<B: AutodiffBackend + TrainingBackend> {
-    model: PackedLlamaForCausalLm<B>,
-    trainable: Trainable<B>,
+pub struct SftTrainer<B: AutodiffBackend + TrainingBackend, M: SftModel<B> = PackedLlamaForCausalLm<B>> {
+    model: M,
+    trainable: Trainable<B, M>,
     config: TrainConfig,
     state: TrainerState,
     device: B::Device,
@@ -351,7 +348,7 @@ pub struct SftTrainer<B: AutodiffBackend + TrainingBackend> {
     data_parallel: Option<ruccl::PeerId>,
 }
 
-impl<B: AutodiffBackend + TrainingBackend> SftTrainer<B> {
+impl<B: AutodiffBackend + TrainingBackend, M: SftModel<B>> SftTrainer<B, M> {
     fn optimizer_config(config: &TrainConfig) -> AdamWConfig {
         AdamWConfig::new()
             .with_beta_1(config.beta_1)
@@ -361,30 +358,30 @@ impl<B: AutodiffBackend + TrainingBackend> SftTrainer<B> {
     }
 
     /// Full fine-tuning: every model parameter is trained.
-    pub fn full(model: PackedLlamaForCausalLm<B>, config: TrainConfig, device: B::Device) -> Self {
-        let optimizer = Self::optimizer_config(&config).init::<B, PackedLlamaForCausalLm<B>>();
+    pub fn full(model: M, config: TrainConfig, device: B::Device) -> Self {
+        let optimizer = Self::optimizer_config(&config).init::<B, M>();
         Self::build(model, Trainable::Full(optimizer), config, device)
     }
 
     /// LoRA: the base model is frozen and only `adapters` are trained.
     pub fn lora(
-        model: PackedLlamaForCausalLm<B>,
-        adapters: LlamaLora<B>,
+        model: M,
+        adapters: M::Adapters,
         config: TrainConfig,
         device: B::Device,
     ) -> Self {
-        let optimizer = Self::optimizer_config(&config).init::<B, LlamaLora<B>>();
+        let optimizer = Self::optimizer_config(&config).init::<B, M::Adapters>();
         Self::build(model.no_grad(), Trainable::Lora { adapters, optimizer }, config, device)
     }
 
     fn build(
-        model: PackedLlamaForCausalLm<B>,
-        trainable: Trainable<B>,
+        model: M,
+        trainable: Trainable<B, M>,
         config: TrainConfig,
         device: B::Device,
     ) -> Self {
         assert!(config.gradient_accumulation > 0, "gradient accumulation must be positive");
-        let vocabulary = model.geometry().vocab_size;
+        let vocabulary = model.vocabulary_size();
         Self {
             model,
             trainable,
@@ -433,29 +430,29 @@ impl<B: AutodiffBackend + TrainingBackend> SftTrainer<B> {
     }
 
     pub(super) fn objective_step(&mut self, count: usize, tokens: usize, update_allowed: bool,
-        objective: impl FnMut(&PackedLlamaForCausalLm<B>, Option<&LlamaLora<B>>, usize) -> Result<Tensor<B, 1>, TrainError>,
+        objective: impl FnMut(&M, Option<&M::Adapters>, usize) -> Result<Tensor<B, 1>, TrainError>,
     ) -> Result<StepStats, TrainError> {
-        self.objective_step_inner::<LlamaLora<B>>(count, tokens, update_allowed, None, None, objective)
+        self.objective_step_inner::<M::Adapters>(count, tokens, update_allowed, None, None, objective)
             .map(|(stats, _)| stats)
     }
 
-    pub(super) fn objective_step_with_aux<M: AutodiffModule<B>>(&mut self,
-        count: usize, tokens: usize, auxiliary: &M, auxiliary_max_grad_norm: Option<f32>,
-        objective: impl FnMut(&PackedLlamaForCausalLm<B>, Option<&LlamaLora<B>>, usize) -> Result<Tensor<B, 1>, TrainError>,
+    pub(super) fn objective_step_with_aux<A: AutodiffModule<B>>(&mut self,
+        count: usize, tokens: usize, auxiliary: &A, auxiliary_max_grad_norm: Option<f32>,
+        objective: impl FnMut(&M, Option<&M::Adapters>, usize) -> Result<Tensor<B, 1>, TrainError>,
     ) -> Result<(StepStats, GradientsParams), TrainError> {
         self.objective_step_inner(count, tokens, true, Some(auxiliary), auxiliary_max_grad_norm, objective)
     }
 
-    fn objective_step_inner<M: AutodiffModule<B>>(&mut self,
-        count: usize, tokens: usize, update_allowed: bool, auxiliary: Option<&M>,
+    fn objective_step_inner<A: AutodiffModule<B>>(&mut self,
+        count: usize, tokens: usize, update_allowed: bool, auxiliary: Option<&A>,
         auxiliary_max_grad_norm: Option<f32>,
-        mut objective: impl FnMut(&PackedLlamaForCausalLm<B>, Option<&LlamaLora<B>>, usize) -> Result<Tensor<B, 1>, TrainError>,
+        mut objective: impl FnMut(&M, Option<&M::Adapters>, usize) -> Result<Tensor<B, 1>, TrainError>,
     ) -> Result<(StepStats, GradientsParams), TrainError> {
         if count == 0 { return Err(error("an objective update needs at least one sample")); }
         let mut sum = 0.0;
-        let mut accumulator = GradientsAccumulator::<PackedLlamaForCausalLm<B>>::new();
-        let mut lora_accumulator = GradientsAccumulator::<LlamaLora<B>>::new();
-        let mut auxiliary_accumulator = GradientsAccumulator::<M>::new();
+        let mut accumulator = GradientsAccumulator::<M>::new();
+        let mut lora_accumulator = GradientsAccumulator::<M::Adapters>::new();
+        let mut auxiliary_accumulator = GradientsAccumulator::<A>::new();
         for index in 0..count {
             let loss = objective(&self.model, self.adapters(), index)?;
             sum += read_scalar(loss.clone())?;
@@ -503,11 +500,11 @@ impl<B: AutodiffBackend + TrainingBackend> SftTrainer<B> {
         Ok((StepStats { step: self.state.step, loss: sum, grad_norm, learning_rate, tokens, applied }, auxiliary_grads))
     }
 
-    pub fn model(&self) -> &PackedLlamaForCausalLm<B> {
+    pub fn model(&self) -> &M {
         &self.model
     }
 
-    pub fn adapters(&self) -> Option<&LlamaLora<B>> {
+    pub fn adapters(&self) -> Option<&M::Adapters> {
         match &self.trainable {
             Trainable::Lora { adapters, .. } => Some(adapters),
             Trainable::Full(_) => None,
@@ -536,7 +533,7 @@ impl<B: AutodiffBackend + TrainingBackend> SftTrainer<B> {
     }
 
     /// Final model and (for LoRA) adapters.
-    pub fn into_parts(self) -> (PackedLlamaForCausalLm<B>, Option<LlamaLora<B>>) {
+    pub fn into_parts(self) -> (M, Option<M::Adapters>) {
         match self.trainable {
             Trainable::Lora { adapters, .. } => (self.model, Some(adapters)),
             Trainable::Full(_) => (self.model, None),
@@ -544,8 +541,8 @@ impl<B: AutodiffBackend + TrainingBackend> SftTrainer<B> {
     }
 }
 
-impl<B: AutodiffBackend + TrainingBackend> SftTrainer<B> {
-    fn micro_loss(&self, batch: &SftBatch, normalizer: usize) -> Tensor<B, 1> {
+impl<B: AutodiffBackend + TrainingBackend, M: SftModel<B>> SftTrainer<B, M> {
+    fn micro_loss(&self, batch: &SftBatch, normalizer: usize) -> Result<Tensor<B, 1>, TrainError> {
         let tokens = Tensor::<B, 2, Int>::from_data(
             TensorData::new(batch.tokens.clone(), [batch.batch, batch.length]),
             &self.device,
@@ -559,7 +556,7 @@ impl<B: AutodiffBackend + TrainingBackend> SftTrainer<B> {
             Trainable::Lora { adapters, .. } => Some(adapters),
             Trainable::Full(_) => None,
         };
-        self.model.train_loss(tokens, targets, normalizer, adapters, chunk)
+        self.model.sft_loss(tokens, targets, normalizer, adapters, chunk)
     }
 
     fn validate(&self, batch: &SftBatch) -> Result<(), TrainError> {
@@ -596,7 +593,7 @@ impl<B: AutodiffBackend + TrainingBackend> SftTrainer<B> {
     }
 }
 
-impl<B: AutodiffBackend + TrainingBackend> SftTrainer<B> {
+impl<B: AutodiffBackend + TrainingBackend, M: SftModel<B>> SftTrainer<B, M> {
     /// One optimizer step over `micro_batches` (gradient accumulation).
     pub fn step(&mut self, micro_batches: &[SftBatch]) -> Result<StepStats, TrainError> {
         if micro_batches.is_empty() {
@@ -610,9 +607,9 @@ impl<B: AutodiffBackend + TrainingBackend> SftTrainer<B> {
         let mut loss_sum = 0.0f32;
         let (grads, norm) = match &self.trainable {
             Trainable::Full(_) => {
-                let mut accumulator = GradientsAccumulator::<PackedLlamaForCausalLm<B>>::new();
+                let mut accumulator = GradientsAccumulator::<M>::new();
                 for batch in micro_batches {
-                    let loss = self.micro_loss(batch, normalizer);
+                    let loss = self.micro_loss(batch, normalizer)?;
                     loss_sum += read_scalar(loss.clone())?;
                     let grads = GradientsParams::from_grads(loss.backward(), &self.model);
                     accumulator.accumulate::<B>(&self.model, grads);
@@ -623,9 +620,9 @@ impl<B: AutodiffBackend + TrainingBackend> SftTrainer<B> {
                 (grads, norm)
             }
             Trainable::Lora { adapters, .. } => {
-                let mut accumulator = GradientsAccumulator::<LlamaLora<B>>::new();
+                let mut accumulator = GradientsAccumulator::<M::Adapters>::new();
                 for batch in micro_batches {
-                    let loss = self.micro_loss(batch, normalizer);
+                    let loss = self.micro_loss(batch, normalizer)?;
                     loss_sum += read_scalar(loss.clone())?;
                     let grads = GradientsParams::from_grads(loss.backward(), adapters);
                     accumulator.accumulate::<B>(adapters, grads);
@@ -680,7 +677,7 @@ fn io(failure: std::io::Error) -> TrainError {
     error(format!("checkpoint I/O failed: {failure}"))
 }
 
-impl<B: AutodiffBackend + TrainingBackend> SftTrainer<B> {
+impl<B: AutodiffBackend + TrainingBackend, M: SftModel<B>> SftTrainer<B, M> {
     /// Write `checkpoint_dir/step-N` atomically, point `latest` at it and
     /// delete older checkpoints beyond `keep_checkpoints`. For LoRA only the
     /// adapters are saved; the frozen base is reloaded from its source.
@@ -748,7 +745,7 @@ impl<B: AutodiffBackend + TrainingBackend> SftTrainer<B> {
     }
 }
 
-impl<B: AutodiffBackend + TrainingBackend> SftTrainer<B> {
+impl<B: AutodiffBackend + TrainingBackend, M: SftModel<B>> SftTrainer<B, M> {
     /// Restore the newest checkpoint under `checkpoint_dir`, if any. Returns
     /// the restored step. The loader position is restored by [`Self::train`].
     pub fn resume(&mut self) -> Result<Option<usize>, TrainError> {
@@ -798,7 +795,7 @@ impl<B: AutodiffBackend + TrainingBackend> SftTrainer<B> {
     }
 }
 
-impl<B: AutodiffBackend + TrainingBackend> SftTrainer<B> {
+impl<B: AutodiffBackend + TrainingBackend, M: SftModel<B>> SftTrainer<B, M> {
     /// Train until `schedule.total_steps`, resuming the loader position from
     /// the trainer state when present. `on_progress` runs every `log_every`
     /// steps and must not block. Checkpoints are written every

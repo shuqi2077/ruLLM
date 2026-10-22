@@ -63,7 +63,7 @@ pub struct LoraPair<B: Backend> {
 }
 
 impl<B: Backend> LoraPair<B> {
-    fn new(input: usize, output: usize, rank: usize, device: &B::Device) -> Self {
+    pub(crate) fn new(input: usize, output: usize, rank: usize, device: &B::Device) -> Self {
         let std = 1.0 / (input as f64).sqrt();
         Self {
             a: Param::from_tensor(

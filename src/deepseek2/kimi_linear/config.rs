@@ -42,9 +42,9 @@ fn sigmoid_name() -> String { "sigmoid".into() }
 impl KimiLinearConfig {
     pub fn limits(&self) -> CausalModelLimits { CausalModelLimits {vocab_size: self.vocab_size, max_sequence_length: self.model_max_length} }
     pub fn is_kda_layer(&self, index: usize) -> bool { self.linear_attn_config.as_ref().is_some_and(|c| c.kda_layers.contains(&(index + 1))) }
-    pub(super) fn is_moe(&self, index: usize) -> bool { self.num_experts.is_some() && index >= self.first_k_dense_replace && index % self.moe_layer_freq == 0 }
+    pub(crate) fn is_moe(&self, index: usize) -> bool { self.num_experts.is_some() && index >= self.first_k_dense_replace && index % self.moe_layer_freq == 0 }
     pub(super) fn mla_layers(&self) -> usize { (0..self.num_hidden_layers).filter(|&i| !self.is_kda_layer(i)).count() }
-    pub(super) fn routing(&self) -> DeepseekV2Config {
+    pub(crate) fn routing(&self) -> DeepseekV2Config {
         DeepseekV2Config {
             model_type: self.model_type.clone(), vocab_size: self.vocab_size, hidden_size: self.hidden_size,
             intermediate_size: self.intermediate_size, moe_intermediate_size: self.moe_intermediate_size.unwrap_or(0),

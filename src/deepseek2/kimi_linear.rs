@@ -11,6 +11,7 @@ mod loading;
 mod kda;
 mod cache;
 mod batching;
+mod training;
 #[cfg(feature = "tensor-parallel")]
 mod parallel;
 #[cfg(feature = "tensor-parallel")]
@@ -18,6 +19,7 @@ pub use parallel::{KimiLinearExpertParallel, KimiLinearExpertParallelCache, Kimi
     LoadedKimiLinearExpertParallel, load_huggingface_kimi_linear_expert_parallel};
 pub use config::{KimiLinearConfig, KimiLinearAttentionConfig};
 pub use loading::{LoadedKimiLinear, load_huggingface_kimi_linear};
+pub(crate) use loading::load_sft as load_kimi_linear_sft;
 pub use cache::{KimiLinearCache, KimiLinearCacheRecord};
 pub use batching::{KimiLinearBatchCache, KimiLinearBatchPrefix, KimiLinearBatchDelta};
 use cache::LayerCache;

@@ -8,6 +8,12 @@ pub fn load_huggingface_kimi_linear<B: super::super::MlaFp8Backend>(directory: i
     -> Result<LoadedKimiLinear<B>, HuggingFaceLoadError> {
     load_rank(directory.as_ref(), device, None, None)
 }
+
+pub(crate) fn load_sft<B: Backend>(directory: &Path, device: &B::Device)
+    -> Result<crate::training::NativeSftModel<B>, HuggingFaceLoadError> {
+    load_rank_with(directory, device, None, None, None)?.model.into_training()
+        .map_err(|e| HuggingFaceLoadError(e.to_string()))
+}
 fn tensor<B: Backend, const D: usize>(checkpoint: &mut weights::Weights<B>, name: &str,
     shape: [usize; D], device: &B::Device, dtype: DType) -> Result<Tensor<B, D>, HuggingFaceLoadError> {
     let tensor = checkpoint.tensor(name, shape, device)?;
@@ -16,6 +22,13 @@ fn tensor<B: Backend, const D: usize>(checkpoint: &mut weights::Weights<B>, name
 }
 pub(super) fn load_rank<B: super::super::MlaFp8Backend>(directory: &Path, device: &B::Device,
     shard: Option<(usize, usize)>, reduction: Option<Arc<dyn Fn(Tensor<B, 3>) -> Tensor<B, 3> + Send + Sync>>)
+    -> Result<LoadedKimiLinear<B>, HuggingFaceLoadError> {
+    load_rank_with(directory, device, shard, reduction, Some(weights::native_projection::<B>))
+}
+
+fn load_rank_with<B: Backend>(directory: &Path, device: &B::Device,
+    shard: Option<(usize, usize)>, reduction: Option<Arc<dyn Fn(Tensor<B, 3>) -> Tensor<B, 3> + Send + Sync>>,
+    loader: Option<weights::Loader<B>>)
     -> Result<LoadedKimiLinear<B>, HuggingFaceLoadError> {
     let fail = |e: std::io::Error| HuggingFaceLoadError(e.to_string());
     let directory = directory.canonicalize().map_err(fail)?;
@@ -27,7 +40,7 @@ pub(super) fn load_rank<B: super::super::MlaFp8Backend>(directory: &Path, device
         return Err(HuggingFaceLoadError("Kimi Linear EP requires equal nonempty expert shards".into()));
     }
     let routing = config.routing();
-    let mut checkpoint = weights::Weights::open(&directory, &routing, Some(weights::native_projection::<B>))?;
+    let mut checkpoint = weights::Weights::open(&directory, &routing, loader)?;
     let embedding = checkpoint.tensor("model.embed_tokens.weight", [config.vocab_size, config.hidden_size], device)?;
     let dtype = embedding.dtype(); let c = &config;
     let mut excluded = BTreeSet::new(); let mut layers = Vec::with_capacity(c.num_hidden_layers);

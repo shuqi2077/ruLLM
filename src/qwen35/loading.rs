@@ -329,6 +329,7 @@ fn load_model<B: Backend>(config_path: std::path::PathBuf, config: Qwen35TextCon
         },
         model: Qwen35TextModel {
             rotary: config.rotary_parameters()?,
+            weight_prefix: base.into(),
             config,
             embedding,
             layers,

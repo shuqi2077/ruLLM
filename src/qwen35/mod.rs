@@ -16,6 +16,7 @@ mod loading;
 mod quantized_loading;
 mod fp8_loading;
 mod projection;
+mod training;
 use projection::Projection;
 #[cfg(feature = "tensor-parallel")]
 pub(crate) mod parallel;
@@ -92,6 +93,7 @@ struct Layer<B: Backend> {
 
 pub struct Qwen35TextModel<B: Backend> {
     pub config: Qwen35TextConfig,
+    weight_prefix: String,
     rotary: crate::llama::rope::RopeParameters,
     embedding: Embedding<B>,
     layers: Vec<Layer<B>>,

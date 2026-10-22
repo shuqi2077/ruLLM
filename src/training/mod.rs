@@ -1,5 +1,6 @@
-//! Supervised fine-tuning and continued pre-training for packed Llama/Qwen2
-//! models: memory-efficient training operators, LoRA, tokenized datasets
+//! Supervised fine-tuning and continued pre-training for Llama/Qwen2,
+//! Qwen3/Qwen3.5 dense/MoE, DeepSeek MLA and Kimi Linear: training operators,
+//! LoRA, tokenized datasets
 //! with resumable shuffling, an AdamW trainer with gradient accumulation,
 //! global-norm clipping, warmup + cosine schedule, atomic checkpoints and
 //! progress reporting, and Hugging Face Safetensors export.
@@ -13,6 +14,13 @@ pub mod post_training;
 pub mod reward;
 mod rollout;
 pub(crate) mod trainer;
+mod model;
+pub(crate) mod native;
+mod loading;
+
+pub use model::SftModel;
+pub use native::{NativeLora, NativeSftModel};
+pub use loading::load_huggingface_native_sft;
 
 pub use data::{
     IGNORE_INDEX, SftBatch, SftDataset, SftExample, SftLoader, SftLoaderState, TextFormat,

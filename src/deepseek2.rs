@@ -18,6 +18,7 @@ mod cache;
 mod batching;
 mod routing;
 mod feed_forward;
+pub(crate) mod training;
 mod kimi_linear;
 pub use kimi_linear::*;
 mod weights;

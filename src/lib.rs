@@ -61,8 +61,9 @@ pub mod serving;
 
 pub use openai_server::{OpenAiServerConfig, serve_openai};
 pub use training::{
-    LlamaLora, LoraConfig, LoraTargets, SftDataset, SftLoader, SftTrainer, TrainConfig,
+    LlamaLora, LoraConfig, LoraTargets, NativeLora, NativeSftModel, SftModel, SftDataset, SftLoader, SftTrainer, TrainConfig,
     export_huggingface_safetensors,
+    load_huggingface_native_sft,
 };
 pub use training::{DpoTrainer, PpoTrainer, GrpoTrainer, RewardTrainer, ReferencePolicy, ValueCritic,
     Response, PagedResponse, ResponseRecord, PreferencePair, PpoConfig, GrpoConfig, PpoRollout, GrpoRollout, PostTrainingState};

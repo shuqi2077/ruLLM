@@ -119,7 +119,7 @@ pub(super) fn load_rank<B: Backend>(directory: &Path, source: &Qwen35TextConfig,
     config.validate()?;
     B::sync(device).map_err(|e| HuggingFaceLoadError(e.to_string()))?;
     Ok(super::super::loading::LoadedQwen35Text {
-        model: Qwen35TextModel { rotary: config.rotary_parameters()?, config,
+        model: Qwen35TextModel { rotary: config.rotary_parameters()?, config, weight_prefix: base.into(),
             embedding: Embedding { weight: Param::from_tensor(embedding) }, layers, norm, head, reduction: Some(reduction) },
         report: HuggingFaceLoadReport { config_path: directory.join("config.json"), weight_files: checkpoint.files,
             applied_tensors: checkpoint.consumed.len(), tied_word_embeddings: source.tie_word_embeddings },

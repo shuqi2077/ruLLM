@@ -16,6 +16,7 @@ use std::sync::Arc;
 mod draft;
 mod batching;
 mod moe;
+mod training;
 pub use moe::Qwen3MoeConfig;
 #[cfg(feature = "tensor-parallel")]
 pub mod parallel;
@@ -107,7 +108,7 @@ impl Qwen3Config {
         Ok(())
     }
 
-    fn rotary_parameters(&self) -> Result<crate::llama::rope::RopeParameters, HuggingFaceLoadError> {
+    pub(crate) fn rotary_parameters(&self) -> Result<crate::llama::rope::RopeParameters, HuggingFaceLoadError> {
         crate::huggingface::rope::layer_parameters(self.head_dim, self.max_position_embeddings, self.rope_theta,
             None, 1.0, self.rope_scaling.as_ref(), self.layer_types.as_deref(), self.num_hidden_layers)
     }
