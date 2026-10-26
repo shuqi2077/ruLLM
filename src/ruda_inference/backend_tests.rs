@@ -60,7 +60,13 @@ where R: DeviceRuntime,R::Server:ComputeServer,R::Device:DeviceOps+Default,
     let device=R::Device::default();
     let width=reduction_width::<R>(&device,dtype,8).expect("test needs fixed subgroup") as usize;
     let dimension=2*width;
-    let (batch,qheads,kvheads,capacity,length)=(2,4,2,17,7);
+    check_decode_shape::<R>(dtype,dimension,7,17);
+}
+fn check_decode_shape<R>(dtype:DType,dimension:usize,length:usize,capacity:usize)
+where R: DeviceRuntime,R::Server:ComputeServer,R::Device:DeviceOps+Default,
+{
+    let device=R::Device::default();
+    let (batch,qheads,kvheads)=(2,4,2);
     let q:Vec<_>=(0..batch*qheads*dimension).map(|i|round(((i%29)as f32-14.0)/47.0,dtype)).collect();
     let k:Vec<_>=(0..batch*kvheads*capacity*dimension).map(|i|round(((i%23)as f32-11.0)/37.0,dtype)).collect();
     let v:Vec<_>=(0..batch*kvheads*capacity*dimension).map(|i|round(((i%31)as f32-15.0)/19.0,dtype)).collect();
@@ -104,6 +110,14 @@ macro_rules! runtime_matrix {
             fn decode_f32_device_subgroup(){check_decode::<$runtime>(DType::F32);}
             #[test] #[ignore="requires real GPU with BF16 arithmetic"]
             fn decode_bf16_device_subgroup(){check_decode::<$runtime>(DType::BF16);}
+            #[test] #[ignore="requires real GPU with F16/BF16 arithmetic"]
+            fn parallel_decode_shapes_and_capacity(){
+                for dtype in [DType::F32,DType::F16,DType::BF16] {
+                    for (dimension,length) in [(33,31),(64,32),(65,33),(128,129),(128,1025),(256,2049)] {
+                        check_decode_shape::<$runtime>(dtype,dimension,length,length+17);
+                    }
+                }
+            }
         }
     }
 }

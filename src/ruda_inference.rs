@@ -813,6 +813,23 @@ where
         query.dtype,
     );
     let client = query.client.clone();
+    let hardware = &client.properties().hardware;
+    let score_capacity = key_sequence.checked_next_power_of_two();
+    let shared_bytes = score_capacity.and_then(|scores| head_dimension.checked_mul(8)
+        .and_then(|partials| scores.checked_add(partials))
+        .and_then(|values| values.checked_add(8)).and_then(|values| values.checked_mul(4)));
+    if subgroup == 32 && key_sequence >= 32 && head_dimension <= 256
+        && hardware.max_units_per_ruda >= 256 && hardware.max_ruda_dim.0 >= 256
+        && shared_bytes.is_some_and(|bytes| bytes <= hardware.max_shared_memory_size)
+    {
+        rudnn::dense_attention_rounded::decode::launch::<R>(
+            &client, RudaCount::Static(checked_u32(rows, "decode rows"), 1, 1), RudaDim::new_1d(256),
+            query.into_array_arg(), key.into_array_arg(), value.into_array_arg(), output.clone().into_array_arg(),
+            query_heads as u32, kv_heads as u32, key_sequence as u32, key_capacity as u32,
+            1.0f32 / (head_dimension as f32).sqrt(), head_dimension, score_capacity.unwrap(), output.dtype.into(),
+        );
+        return Tensor::from_primitive(TensorPrimitive::Float(output));
+    }
     gqa_decode_attention_kernel::launch::<R>(
         &client,
         RudaCount::Static(checked_u32(rows, "decode rows"), 1, 1),
