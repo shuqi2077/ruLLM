@@ -27,13 +27,13 @@ distributed = ["ruda-optim/collective", "dep:ruccl"]
 [dependencies]
 ruda-driver-cann = { version = "0.1.105", path = "../ruda-driver/cann", optional = true }
 ruda-model = { version = "0.21.65", path = "../ruda-model", default-features = false, features = ["std"] }
-ruda-autodiff = { version = "0.21.61", path = "../ruda-autodiff", default-features = false, features = ["std"] }
+ruda-autodiff = { version = "0.21.62", path = "../ruda-autodiff", default-features = false, features = ["std"] }
 ruda-optim = { version = "0.21.72", path = "../ruda-optim", default-features = false, features = ["std"] }
-ruccl = { version = "0.21.83", package = "ruCCL", path = "../ruCCL", default-features = false, optional = true }
+ruccl = { version = "0.21.84", package = "ruCCL", path = "../ruCCL", default-features = false, optional = true }
 ruda-nn = { version = "0.21.74", path = "../ruda-nn", default-features = false, features = ["std"] }
-ruda-tensor = { version = "0.21.76", path = "../ruda-tensor", default-features = false, features = ["std", "kernel"] }
-ruda-tensor-device = { version = "0.21.76", path = "../ruda-tensor/device", default-features = false, features = ["std", "fusion"] }
-ruda-tensor-tch = { version = "0.21.80", path = "../ruda-tensor/tch", optional = true }
+ruda-tensor = { version = "0.21.77", path = "../ruda-tensor", default-features = false, features = ["std", "kernel"] }
+ruda-tensor-device = { version = "0.21.77", path = "../ruda-tensor/device", default-features = false, features = ["std", "fusion"] }
+ruda-tensor-tch = { version = "0.21.81", path = "../ruda-tensor/tch", optional = true }
 tch = { version = "0.22.0", optional = true }
 ruda-store = { version = "0.21.64", path = "../ruda-store", default-features = false, features = ["std", "safetensors", "memmap"] }
 ruda-kernel = { version = "0.1.49", path = "../ruda-kernel", default-features = false, features = ["frontend-std", "library", "packed-quantization"] }
@@ -41,8 +41,8 @@ ruda-core = { version = "0.1.12", path = "../ruda-core", default-features = fals
 ruda = { version = "0.1.50", path = "../ruda", default-features = false, features = ["runtime", "runtime-std", "runtime-storage-bytes"] }
 ruda-driver-hip = { version = "0.1.105", path = "../ruda-driver/hip", default-features = false, features = ["std"], optional = true }
 ruda-driver-cuda = { version = "0.1.105", path = "../ruda-driver/cuda", default-features = false, features = ["std"], optional = true }
-rublas = { version = "0.1.106", path = "../ruBLAS", default-features = false, features = ["tensor-int4", "tensor-matmul", "tensor-ggml", "std"] }
-rudnn = { version = "0.1.106", package = "ruDNN", path = "../ruDNN", default-features = false, features = ["tensor-gated-delta", "tensor-kda", "tensor-normalization", "tensor-paged-attention", "tensor-moe", "std"] }
+rublas = { version = "0.1.107", path = "../ruBLAS", default-features = false, features = ["tensor-int4", "tensor-matmul", "tensor-ggml", "std"] }
+rudnn = { version = "0.1.107", package = "ruDNN", path = "../ruDNN", default-features = false, features = ["tensor-gated-delta", "tensor-kda", "tensor-normalization", "tensor-paged-attention", "tensor-moe", "std"] }
 half = "=2.7.1"
 chacha20 = { version = "=0.10.2", default-features = false, features = ["rng"] }
 serde = { version = "1.0", features = ["derive"] }
