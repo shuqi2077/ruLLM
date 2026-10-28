@@ -60,6 +60,8 @@ Replace `./models/qwen35` with your model directory. The final arguments select 
 
 ## Paged inference, serving, and SFT
 
+The `ruda-serve` CLI accepts `--dtype bf16` (the default) or `--dtype fp16` for model weights, activations, and KV caches. The selection applies to both native and LibTorch workers, including continuous batching and tensor/expert-parallel adapters; target and draft models use the same selected precision.
+
 `ContinuousBatchRunner` executes packed Llama/Qwen2 models over physical paged KV storage, with chunked prefill, optional prefix caching, recompute preemption, and optional greedy n-gram speculative verification. `serve_openai` exposes text completion and chat endpoints, including SSE streaming, without requiring the separate `serving` feature.
 
 `rullm::training` provides full-parameter SFT and FP32 LoRA adapters, memory-efficient attention/backward and chunked full-vocabulary loss, AdamW gradient accumulation, resumable checkpoints, and Hugging Face Safetensors export. These Rust APIs are separate from the Python `SFTTrainer` and NF4 interfaces.

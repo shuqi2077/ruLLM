@@ -17,6 +17,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut autotune_cache_directory = None;
     let mut device_indices = vec![0usize];
     let mut backend = "native".to_string();
+    let mut dtype = worker::Dtype::Bf16;
     let mut libtorch_device = "cuda".to_string();
     let mut explicit_libtorch_device = false;
     let mut role = "integrated".to_string();
@@ -46,6 +47,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
     while let Some(arg) = args.next() {
         if arg == "--help" {
+            println!("[--dtype bf16|fp16 (default bf16; model weights, activations and KV cache)]");
             println!(
                 "ruda-serve --model-path DIR --model-id EXACT-WEIGHTS-IDENTITY [--served-model-name NAME] [--backend native|libtorch (default native; libtorch feature required)] [--libtorch-device cpu|cuda|mps (default cuda)] [--devices 0,1 (Llama/Qwen2/Qwen3(dense/MoE)/Qwen3.5(dense/MoE) TP / DeepSeek-V2/V3/Kimi-K2/Kimi-Linear EP)] [--draft-model-path DIR --draft-model-id EXACT-DRAFT-IDENTITY (Qwen3 DFlash/DSpark; single device or native TP batching)] [--mla-mode expanded|absorbed (DeepSeek-V2/V3/Kimi-K2 only; default expanded)] [--role integrated|prefill|decode] [--prefill-address HOST:PORT (prefill listen/decode connect, TCP host KV)] [--bind 127.0.0.1:8000] [--queue-capacity N] [--multimodal (native Qwen3.5(dense/MoE) JPEG/PNG; single-device integrated)] [--batch-max-sequences N --batch-max-tokens N --batch-kv-pages N --batch-block-tokens N (native Llama/Qwen2/Qwen3(dense/MoE)/Qwen3.5(dense/MoE)/DeepSeek-V2/V3/Kimi-K2/Kimi-Linear text; integrated/prefill/decode; Llama/Qwen2/Qwen3(dense/MoE)/Qwen3.5(dense/MoE) TP/DeepSeek-V2/V3/Kimi-K2/Kimi-Linear EP; prefix/host/SSD cache; Qwen3 draft; no image batching)] [--prefix-block-tokens N] [--prefix-device-entries N] [--kv-host-bytes N] [--kv-disk-directory DIR --kv-disk-bytes N]"
             );
@@ -79,6 +81,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             "--autotune-cache-directory" => autotune_cache_directory = Some(PathBuf::from(value)),
             "--bind" => address = value,
             "--backend" => backend = value,
+            "--dtype" => dtype = value.parse().map_err(io::Error::other)?,
             "--libtorch-device" => {
                 libtorch_device = value;
                 explicit_libtorch_device = true;
@@ -296,6 +299,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let options = worker::Options {
         directory,
         model_id,
+        dtype,
         devices: device_indices,
         prefill_only,
         prefill_address,

@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use tokio::sync::{mpsc, oneshot};
 
 pub struct Options {
+    pub dtype: Dtype,
     pub directory: PathBuf,
     pub model_id: String,
     pub devices: Vec<usize>,
@@ -36,37 +37,55 @@ struct Worker {
 
 type Ready = Option<oneshot::Sender<Result<(), String>>>;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Dtype {
+    Bf16,
+    Fp16,
+}
+
+impl std::str::FromStr for Dtype {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "bf16" => Ok(Self::Bf16),
+            "fp16" => Ok(Self::Fp16),
+            _ => Err("--dtype must be bf16 or fp16".into()),
+        }
+    }
+}
+
 #[cfg(feature="nvidia")]
-fn load_causal_batch(directory:&std::path::Path,device:&ruda_tensor_device::cuda::CudaDevice,mla:DeepseekV2AttentionMode)
-    ->Result<(rullm::CausalBatchModel<rullm::backends::Nvidia<half::bf16,i32,u8>>,Vec<i32>),String> {
-    type B=rullm::backends::Nvidia<half::bf16,i32,u8>;
+fn load_causal_batch<F: ruda_tensor_device::FloatElement>(directory:&std::path::Path,device:&ruda_tensor_device::cuda::CudaDevice,mla:DeepseekV2AttentionMode)
+    ->Result<(rullm::CausalBatchModel<rullm::backends::Nvidia<F,i32,u8>>,Vec<i32>),String> {
+    type B<F>=rullm::backends::Nvidia<F,i32,u8>;
     use rullm::DenseCausalBatchModel as Model;
     let source:serde_json::Value=serde_json::from_slice(&std::fs::read(directory.join("config.json")).map_err(|e|e.to_string())?)
         .map_err(|e|e.to_string())?;
     match source.get("model_type").and_then(serde_json::Value::as_str) {
         Some("llama")=>{
-            let loaded=load_huggingface_llama::<B>(directory,device).map_err(|e|e.to_string())?;
+            let loaded=load_huggingface_llama::<B<F>>(directory,device).map_err(|e|e.to_string())?;
             Ok((Model::Llama(loaded.model).into(),loaded.default_eos_token_ids))
         },
         Some("qwen2")=>{
-            let loaded=load_huggingface_qwen2::<B>(directory,device).map_err(|e|e.to_string())?;
+            let loaded=load_huggingface_qwen2::<B<F>>(directory,device).map_err(|e|e.to_string())?;
             Ok((Model::Llama(loaded.model).into(),loaded.default_eos_token_ids))
         },
         Some("qwen3"|"qwen3_moe")=>{
-            let loaded=load_huggingface_qwen3::<B>(directory,device).map_err(|e|e.to_string())?;
+            let loaded=load_huggingface_qwen3::<B<F>>(directory,device).map_err(|e|e.to_string())?;
             Ok((Model::Qwen3(loaded.model).into(),loaded.eos_token_ids))
         },
         Some("deepseek_v2"|"deepseek_v3"|"kimi_k2")=>{
-            let loaded=load_huggingface_mla::<B>(directory,device).map_err(|e|e.to_string())?;
+            let loaded=load_huggingface_mla::<B<F>>(directory,device).map_err(|e|e.to_string())?;
             Ok((Model::DeepseekV2(loaded.model.with_attention_mode(mla)).into(),loaded.eos_token_ids))
         },
         Some("qwen3_5"|"qwen3_5_text"|"qwen3_5_moe"|"qwen3_5_moe_text")=>{
-            let loaded=load_huggingface_qwen35_text::<B>(directory,device).map_err(|e|e.to_string())?;
+            let loaded=load_huggingface_qwen35_text::<B<F>>(directory,device).map_err(|e|e.to_string())?;
             let eos=vec![loaded.model.config.eos_token_id];
             Ok((rullm::CausalBatchModel::Qwen35(loaded.model),eos))
         },
         Some("kimi_linear")=>{
-            let loaded=rullm::load_huggingface_kimi_linear::<B>(directory,device).map_err(|e|e.to_string())?;
+            let loaded=rullm::load_huggingface_kimi_linear::<B<F>>(directory,device).map_err(|e|e.to_string())?;
             Ok((rullm::CausalBatchModel::KimiLinear(loaded.model),loaded.eos_token_ids))
         },
         other=>Err(format!("no independent causal-draft batch adapter for {other:?}")),
@@ -87,7 +106,10 @@ pub fn run(
             "native" => {
                 #[cfg(feature = "nvidia")]
                 {
-                    worker.run_cuda(&mut ready)
+                    match worker.options.dtype {
+                        Dtype::Bf16 => worker.run_cuda::<half::bf16>(&mut ready),
+                        Dtype::Fp16 => worker.run_cuda::<half::f16>(&mut ready),
+                    }
                 }
                 #[cfg(not(feature = "nvidia"))]
                 {
@@ -137,8 +159,10 @@ pub fn run(
                                 .iter()
                                 .map(|&index| LibTorchDevice::Cuda(index))
                                 .collect();
-                            return worker
-                                .run_parallel::<LibTorch<half::bf16>>(devices, &mut ready);
+                            return match worker.options.dtype {
+                                Dtype::Bf16 => worker.run_parallel::<LibTorch<half::bf16>>(devices, &mut ready),
+                                Dtype::Fp16 => worker.run_parallel::<LibTorch<half::f16>>(devices, &mut ready),
+                            };
                         }
                         #[cfg(not(feature = "tensor-parallel"))]
                         {
@@ -148,7 +172,10 @@ pub fn run(
                             );
                         }
                     }
-                    worker.run_single::<LibTorch<half::bf16>>(device, &mut ready)
+                    match worker.options.dtype {
+                        Dtype::Bf16 => worker.run_single::<LibTorch<half::bf16>>(device, &mut ready),
+                        Dtype::Fp16 => worker.run_single::<LibTorch<half::f16>>(device, &mut ready),
+                    }
                 }
                 #[cfg(not(feature = "libtorch"))]
                 {
@@ -168,6 +195,9 @@ pub fn run(
 
 impl Worker {
     fn new(mut options: Options, jobs: mpsc::Receiver<serving::Job>) -> Result<Self, String> {
+        if options.dtype == Dtype::Fp16 {
+            options.model_id = format!("{}:dtype-fp16", options.model_id);
+        }
         let source: serde_json::Value = serde_json::from_slice(
             &std::fs::read(options.directory.join("config.json")).map_err(|e| e.to_string())?,
         )
@@ -389,13 +419,13 @@ impl Worker {
     }
 
     #[cfg(feature = "nvidia")]
-    fn run_cuda(self, ready: &mut Ready) -> Result<(), String> {
+    fn run_cuda<F: ruda_tensor_device::FloatElement>(self, ready: &mut Ready) -> Result<(), String> {
         use ruda_tensor_device::cuda::{Cuda, CudaDevice};
-        type B = Cuda<half::bf16, i32>;
+        type B<F> = Cuda<F, i32>;
         let device = CudaDevice::new(self.options.devices[0]);
         if self.options.multimodal {
-            type Native = rullm::backends::Nvidia<half::bf16, i32, u8>;
-            let model = rullm::load_huggingface_qwen35_multimodal::<Native>(
+            type Native<F> = rullm::backends::Nvidia<F, i32, u8>;
+            let model = rullm::load_huggingface_qwen35_multimodal::<Native<F>>(
                 &self.options.directory,
                 &device,
             )
@@ -415,7 +445,7 @@ impl Worker {
             );
         }
         if let Some(config) = self.options.batch {
-            type Native = rullm::backends::Nvidia<half::bf16, i32, u8>;
+            type Native<F> = rullm::backends::Nvidia<F, i32, u8>;
             if let Some(draft_tokens)=self.options.causal_draft_tokens {
                 use sha2::{Digest,Sha256};
                 let directory=self.options.draft_directory.as_ref().expect("causal draft directory");
@@ -429,7 +459,7 @@ impl Worker {
                 let target_tokenizer=tokenizer(&self.options.directory)?;
                 if target_tokenizer!=tokenizer(directory)? {return Err("target and causal draft token-ID mappings/decoders differ".into());}
                 let tokenizer_id=format!("{:x}",Sha256::digest(serde_json::to_vec(&target_tokenizer).map_err(|e|e.to_string())?));
-                let (draft,_)=load_causal_batch(directory,&device,DeepseekV2AttentionMode::Expanded)?;
+                let (draft,_)=load_causal_batch::<F>(directory,&device,DeepseekV2AttentionMode::Expanded)?;
                 let draft_config=rullm::CausalDraftBatchConfig {
                     draft_tokens,draft_model_id:self.options.draft_id.clone().expect("causal draft identity"),
                     target_tokenizer_id:tokenizer_id.clone(),draft_tokenizer_id:tokenizer_id,
@@ -441,33 +471,33 @@ impl Worker {
                         return match self.source.get("model_type").and_then(serde_json::Value::as_str) {
                             Some(kind @ ("llama"|"qwen2"))=>{
                                 let loaded=if kind=="qwen2" {
-                                    rullm::load_huggingface_qwen2_tensor_parallel::<Native>(&self.options.directory,devices)
+                                    rullm::load_huggingface_qwen2_tensor_parallel::<Native<F>>(&self.options.directory,devices)
                                 } else {
-                                    rullm::load_huggingface_llama_tensor_parallel::<Native>(&self.options.directory,devices)
+                                    rullm::load_huggingface_llama_tensor_parallel::<Native<F>>(&self.options.directory,devices)
                                 }.map_err(|e|e.to_string())?;
                                 let model=rullm::CausalDraftBatch::new(loaded.model,draft,draft_config).map_err(|e|e.to_string())?;
-                                self.launch_batch::<Native,_>(model,device,loaded.eos_token_ids,config,ready)
+                                self.launch_batch::<Native<F>,_>(model,device,loaded.eos_token_ids,config,ready)
                             },
                             Some("qwen3"|"qwen3_moe")=>{
-                                let loaded=rullm::load_huggingface_qwen3_tensor_parallel::<Native>(&self.options.directory,devices).map_err(|e|e.to_string())?;
+                                let loaded=rullm::load_huggingface_qwen3_tensor_parallel::<Native<F>>(&self.options.directory,devices).map_err(|e|e.to_string())?;
                                 let model=rullm::CausalDraftBatch::new(loaded.model,draft,draft_config).map_err(|e|e.to_string())?;
-                                self.launch_batch::<Native,_>(model,device,loaded.eos_token_ids,config,ready)
+                                self.launch_batch::<Native<F>,_>(model,device,loaded.eos_token_ids,config,ready)
                             },
                             Some("deepseek_v2"|"deepseek_v3"|"kimi_k2")=>{
-                                let loaded=rullm::load_huggingface_mla_expert_parallel::<Native>(&self.options.directory,devices).map_err(|e|e.to_string())?;
+                                let loaded=rullm::load_huggingface_mla_expert_parallel::<Native<F>>(&self.options.directory,devices).map_err(|e|e.to_string())?;
                                 let model=rullm::CausalDraftBatch::new(loaded.model.with_attention_mode(self.options.mla_mode),draft,draft_config).map_err(|e|e.to_string())?;
-                                self.launch_batch::<Native,_>(model,device,loaded.eos_token_ids,config,ready)
+                                self.launch_batch::<Native<F>,_>(model,device,loaded.eos_token_ids,config,ready)
                             },
                             Some("qwen3_5"|"qwen3_5_text"|"qwen3_5_moe"|"qwen3_5_moe_text")=>{
-                                let loaded=rullm::load_huggingface_qwen35_tensor_parallel::<Native>(&self.options.directory,devices).map_err(|e|e.to_string())?;
+                                let loaded=rullm::load_huggingface_qwen35_tensor_parallel::<Native<F>>(&self.options.directory,devices).map_err(|e|e.to_string())?;
                                 let eos=vec![loaded.model.config.eos_token_id];
                                 let model=rullm::CausalDraftBatch::new(loaded.model,draft,draft_config).map_err(|e|e.to_string())?;
-                                self.launch_batch::<Native,_>(model,device,eos,config,ready)
+                                self.launch_batch::<Native<F>,_>(model,device,eos,config,ready)
                             },
                             Some("kimi_linear")=>{
-                                let loaded=rullm::load_huggingface_kimi_linear_expert_parallel::<Native>(&self.options.directory,devices).map_err(|e|e.to_string())?;
+                                let loaded=rullm::load_huggingface_kimi_linear_expert_parallel::<Native<F>>(&self.options.directory,devices).map_err(|e|e.to_string())?;
                                 let model=rullm::CausalDraftBatch::new(loaded.model,draft,draft_config).map_err(|e|e.to_string())?;
-                                self.launch_batch::<Native,_>(model,device,loaded.eos_token_ids,config,ready)
+                                self.launch_batch::<Native<F>,_>(model,device,loaded.eos_token_ids,config,ready)
                             },
                             _=>Err("no parallel causal target adapter".into()),
                         };
@@ -475,9 +505,9 @@ impl Worker {
                     #[cfg(not(feature="tensor-parallel"))]
                     return Err("parallel causal drafting requires the tensor-parallel feature".into());
                 }
-                let (target,eos)=load_causal_batch(&self.options.directory,&device,self.options.mla_mode)?;
+                let (target,eos)=load_causal_batch::<F>(&self.options.directory,&device,self.options.mla_mode)?;
                 let model=rullm::CausalDraftBatch::new(target,draft,draft_config).map_err(|e|e.to_string())?;
-                return self.launch_batch::<Native,_>(model,device,eos,config,ready);
+                return self.launch_batch::<Native<F>,_>(model,device,eos,config,ready);
             }
             if self.options.devices.len()>1 {
                 #[cfg(feature = "tensor-parallel")]
@@ -486,38 +516,38 @@ impl Worker {
                     return match self.source.get("model_type").and_then(serde_json::Value::as_str) {
                         Some(kind @ ("llama"|"qwen2"))=>{
                             let loaded=if kind=="qwen2" {
-                                rullm::load_huggingface_qwen2_tensor_parallel::<Native>(&self.options.directory,devices)
+                                rullm::load_huggingface_qwen2_tensor_parallel::<Native<F>>(&self.options.directory,devices)
                             } else {
-                                rullm::load_huggingface_llama_tensor_parallel::<Native>(&self.options.directory,devices)
+                                rullm::load_huggingface_llama_tensor_parallel::<Native<F>>(&self.options.directory,devices)
                             }.map_err(|e|e.to_string())?;
-                            self.launch_batch::<Native,_>(loaded.model,device,loaded.eos_token_ids,config,ready)
+                            self.launch_batch::<Native<F>,_>(loaded.model,device,loaded.eos_token_ids,config,ready)
                         },
                         Some("qwen3"|"qwen3_moe")=>{
-                            let loaded=rullm::load_huggingface_qwen3_tensor_parallel::<Native>(&self.options.directory,devices).map_err(|e|e.to_string())?;
+                            let loaded=rullm::load_huggingface_qwen3_tensor_parallel::<Native<F>>(&self.options.directory,devices).map_err(|e|e.to_string())?;
                             if let Some(directory)=&self.options.draft_directory {
                                 let model=loaded.model.with_draft(directory).map_err(|e|e.to_string())?;
-                                return self.launch_batch::<Native,_>(model,device,loaded.eos_token_ids,config,ready);
+                                return self.launch_batch::<Native<F>,_>(model,device,loaded.eos_token_ids,config,ready);
                             }
-                            self.launch_batch::<Native,_>(loaded.model,device,loaded.eos_token_ids,config,ready)
+                            self.launch_batch::<Native<F>,_>(loaded.model,device,loaded.eos_token_ids,config,ready)
                         },
                         Some("deepseek_v2"|"deepseek_v3"|"kimi_k2")=>{
                             if self.options.mtp {
-                                let loaded=rullm::load_huggingface_mla_mtp_expert_parallel::<Native>(&self.options.directory,devices).map_err(|e|e.to_string())?;
+                                let loaded=rullm::load_huggingface_mla_mtp_expert_parallel::<Native<F>>(&self.options.directory,devices).map_err(|e|e.to_string())?;
                                 let model=loaded.model.with_attention_mode(self.options.mla_mode);
-                                return self.launch_batch::<Native,_>(model,device,loaded.eos_token_ids,config,ready);
+                                return self.launch_batch::<Native<F>,_>(model,device,loaded.eos_token_ids,config,ready);
                             }
-                            let loaded=rullm::load_huggingface_mla_expert_parallel::<Native>(&self.options.directory,devices).map_err(|e|e.to_string())?;
+                            let loaded=rullm::load_huggingface_mla_expert_parallel::<Native<F>>(&self.options.directory,devices).map_err(|e|e.to_string())?;
                             let model=loaded.model.with_attention_mode(self.options.mla_mode);
-                            self.launch_batch::<Native,_>(model,device,loaded.eos_token_ids,config,ready)
+                            self.launch_batch::<Native<F>,_>(model,device,loaded.eos_token_ids,config,ready)
                         },
                         Some("qwen3_5"|"qwen3_5_text"|"qwen3_5_moe"|"qwen3_5_moe_text")=>{
-                            let loaded=rullm::load_huggingface_qwen35_tensor_parallel::<Native>(&self.options.directory,devices).map_err(|e|e.to_string())?;
+                            let loaded=rullm::load_huggingface_qwen35_tensor_parallel::<Native<F>>(&self.options.directory,devices).map_err(|e|e.to_string())?;
                             let eos=vec![loaded.model.config.eos_token_id];
-                            self.launch_batch::<Native,_>(loaded.model,device,eos,config,ready)
+                            self.launch_batch::<Native<F>,_>(loaded.model,device,eos,config,ready)
                         },
                         Some("kimi_linear")=>{
-                            let loaded=rullm::load_huggingface_kimi_linear_expert_parallel::<Native>(&self.options.directory,devices).map_err(|e|e.to_string())?;
-                            self.launch_batch::<Native,_>(loaded.model,device,loaded.eos_token_ids,config,ready)
+                            let loaded=rullm::load_huggingface_kimi_linear_expert_parallel::<Native<F>>(&self.options.directory,devices).map_err(|e|e.to_string())?;
+                            self.launch_batch::<Native<F>,_>(loaded.model,device,loaded.eos_token_ids,config,ready)
                         },
                         _=>Err("no parallel continuous-batch model adapter".into()),
                     };
@@ -527,62 +557,62 @@ impl Worker {
             }
             return match self.source.get("model_type").and_then(serde_json::Value::as_str) {
                 Some("llama")=>{
-                    let loaded=load_huggingface_llama::<Native>(&self.options.directory,&device).map_err(|e|e.to_string())?;
-                    self.launch_batch::<Native,_>(loaded.model,device,loaded.default_eos_token_ids,config,ready)
+                    let loaded=load_huggingface_llama::<Native<F>>(&self.options.directory,&device).map_err(|e|e.to_string())?;
+                    self.launch_batch::<Native<F>,_>(loaded.model,device,loaded.default_eos_token_ids,config,ready)
                 },
                 Some("qwen2")=>{
-                    let loaded=load_huggingface_qwen2::<Native>(&self.options.directory,&device).map_err(|e|e.to_string())?;
-                    self.launch_batch::<Native,_>(loaded.model,device,loaded.default_eos_token_ids,config,ready)
+                    let loaded=load_huggingface_qwen2::<Native<F>>(&self.options.directory,&device).map_err(|e|e.to_string())?;
+                    self.launch_batch::<Native<F>,_>(loaded.model,device,loaded.default_eos_token_ids,config,ready)
                 },
                 Some("qwen3"|"qwen3_moe")=>{
-                    let loaded=load_huggingface_qwen3::<Native>(&self.options.directory,&device).map_err(|e|e.to_string())?;
+                    let loaded=load_huggingface_qwen3::<Native<F>>(&self.options.directory,&device).map_err(|e|e.to_string())?;
                     if let Some(directory)=&self.options.draft_directory {
                         let model=rullm::load_huggingface_qwen3_draft(loaded.model,directory).map_err(|e|e.to_string())?;
-                        return self.launch_batch::<Native,_>(model,device,loaded.eos_token_ids,config,ready);
+                        return self.launch_batch::<Native<F>,_>(model,device,loaded.eos_token_ids,config,ready);
                     }
-                    self.launch_batch::<Native,_>(loaded.model,device,loaded.eos_token_ids,config,ready)
+                    self.launch_batch::<Native<F>,_>(loaded.model,device,loaded.eos_token_ids,config,ready)
                 },
                 Some("deepseek_v2"|"deepseek_v3"|"kimi_k2")=>{
                     if self.options.mtp {
-                        let loaded=rullm::load_huggingface_mla_mtp::<Native>(&self.options.directory,&device).map_err(|e|e.to_string())?;
+                        let loaded=rullm::load_huggingface_mla_mtp::<Native<F>>(&self.options.directory,&device).map_err(|e|e.to_string())?;
                         let model=loaded.model.with_attention_mode(self.options.mla_mode);
-                        return self.launch_batch::<Native,_>(model,device,loaded.eos_token_ids,config,ready);
+                        return self.launch_batch::<Native<F>,_>(model,device,loaded.eos_token_ids,config,ready);
                     }
-                    let loaded=load_huggingface_mla::<Native>(&self.options.directory,&device).map_err(|e|e.to_string())?;
+                    let loaded=load_huggingface_mla::<Native<F>>(&self.options.directory,&device).map_err(|e|e.to_string())?;
                     let model=loaded.model.with_attention_mode(self.options.mla_mode);
-                    self.launch_batch::<Native,_>(model,device,loaded.eos_token_ids,config,ready)
+                    self.launch_batch::<Native<F>,_>(model,device,loaded.eos_token_ids,config,ready)
                 },
                 Some("qwen3_5"|"qwen3_5_text"|"qwen3_5_moe"|"qwen3_5_moe_text")=>{
-                    let loaded=load_huggingface_qwen35_text::<Native>(&self.options.directory,&device).map_err(|e|e.to_string())?;
+                    let loaded=load_huggingface_qwen35_text::<Native<F>>(&self.options.directory,&device).map_err(|e|e.to_string())?;
                     let eos=vec![loaded.model.config.eos_token_id];
-                    self.launch_batch::<Native,_>(loaded.model,device,eos,config,ready)
+                    self.launch_batch::<Native<F>,_>(loaded.model,device,eos,config,ready)
                 },
                 Some("kimi_linear")=>{
-                    let loaded=rullm::load_huggingface_kimi_linear::<Native>(&self.options.directory,&device).map_err(|e|e.to_string())?;
-                    self.launch_batch::<Native,_>(loaded.model,device,loaded.eos_token_ids,config,ready)
+                    let loaded=rullm::load_huggingface_kimi_linear::<Native<F>>(&self.options.directory,&device).map_err(|e|e.to_string())?;
+                    self.launch_batch::<Native<F>,_>(loaded.model,device,loaded.eos_token_ids,config,ready)
                 },
                 _=>Err("no continuous-batch model adapter".into()),
             };
         }
         if self.source.get("model_type").and_then(serde_json::Value::as_str)==Some("kimi_linear") {
-            type Native = rullm::backends::Nvidia<half::bf16,i32,u8>;
+            type Native<F> = rullm::backends::Nvidia<F,i32,u8>;
             if self.options.devices.len()==1 {
-                let loaded=rullm::load_huggingface_kimi_linear::<Native>(&self.options.directory,&device).map_err(|e|e.to_string())?;
+                let loaded=rullm::load_huggingface_kimi_linear::<Native<F>>(&self.options.directory,&device).map_err(|e|e.to_string())?;
                 let limits=loaded.model.limits();
-                return self.launch::<Native,_>(loaded.model,device,limits,loaded.eos_token_ids,ready);
+                return self.launch::<Native<F>,_>(loaded.model,device,limits,loaded.eos_token_ids,ready);
             }
             #[cfg(feature="tensor-parallel")]
             {
                 let devices=self.options.devices.iter().map(|&id|CudaDevice::new(id)).collect();
-                let loaded=rullm::load_huggingface_kimi_linear_expert_parallel::<Native>(&self.options.directory,devices).map_err(|e|e.to_string())?;
+                let loaded=rullm::load_huggingface_kimi_linear_expert_parallel::<Native<F>>(&self.options.directory,devices).map_err(|e|e.to_string())?;
                 let limits=loaded.model.limits();
-                return self.launch::<Native,_>(loaded.model,device,limits,loaded.eos_token_ids,ready);
+                return self.launch::<Native<F>,_>(loaded.model,device,limits,loaded.eos_token_ids,ready);
             }
             #[cfg(not(feature="tensor-parallel"))]
             return Err("Kimi Linear EP requires the tensor-parallel feature".into());
         }
         if self.options.devices.len() == 1 {
-            return self.run_single::<B>(device, ready);
+            return self.run_single::<B<F>>(device, ready);
         }
         #[cfg(feature = "tensor-parallel")]
         {
@@ -592,7 +622,7 @@ impl Worker {
                 .iter()
                 .map(|&id| CudaDevice::new(id))
                 .collect();
-            self.run_parallel::<B>(devices, ready)
+            self.run_parallel::<B<F>>(devices, ready)
         }
         #[cfg(not(feature = "tensor-parallel"))]
         {
